@@ -1,13 +1,15 @@
 (function () {
-  if (window.__instaswiftV10Loaded) return;
-  window.__instaswiftV10Loaded = true;
+  if (window.__instaswiftV16Loaded) return;
+  window.__instaswiftV16Loaded = true;
 
   const IG_APP_ID = "936619743392459";
 
-  const graphqlCapture = {
+  const capturedMeta = {
     postsDocId: "9310670392322965",
     reelsDocId: "7898261790222653",
-    lsdToken: ""
+    lsdToken: "",
+    wwwClaim: "0",
+    asbdId: "129477"
   };
 
   function getCsrfToken() {
@@ -16,11 +18,25 @@
   }
 
   function getLsdToken() {
-    if (graphqlCapture.lsdToken) return graphqlCapture.lsdToken;
+    if (capturedMeta.lsdToken) return capturedMeta.lsdToken;
     const html = document.documentElement?.innerHTML || "";
-    const m = html.match(/\["LSD",\[\],\{"token":"([^"]+)"\}/) || html.match(/"lsd":"([^"]+)"/);
-    if (m && m[1]) graphqlCapture.lsdToken = m[1];
-    return graphqlCapture.lsdToken;
+    const m =
+      html.match(/["LSD",[],\{"token":"([^"]+)"\}/) ||
+      html.match(/"lsd":"([^"]+)"/) ||
+      html.match(/name="lsd"\s+value="([^"]+)"/);
+    if (m && m[1]) capturedMeta.lsdToken = m[1];
+    return capturedMeta.lsdToken;
+  }
+
+  function getSessionMeta() {
+    return {
+      csrfToken: getCsrfToken(),
+      lsdToken: getLsdToken(),
+      wwwClaim: sessionStorage.getItem("www-claim-v2") || capturedMeta.wwwClaim || "0",
+      postsDocId: capturedMeta.postsDocId,
+      reelsDocId: capturedMeta.reelsDocId,
+      asbdId: capturedMeta.asbdId
+    };
   }
 
   function emitToContent(type, data) {
@@ -45,27 +61,29 @@
 
   function inspectRequestForGraphqlMeta(url, bodyStr) {
     try {
-      if (!bodyStr && url.includes("doc_id=")) {
-        const u = new URL(url, location.origin);
-        const docId = u.searchParams.get("doc_id");
-        const vars = u.searchParams.get("variables") || "";
-        if (docId && vars.includes("username")) {
-          graphqlCapture.postsDocId = docId;
-        }
-      }
       if (typeof bodyStr === "string" && bodyStr.includes("doc_id=")) {
         const params = new URLSearchParams(bodyStr);
         const friendly = params.get("fb_api_req_friendly_name") || "";
         const docId = params.get("doc_id") || "";
         const lsd = params.get("lsd") || "";
-        if (lsd) graphqlCapture.lsdToken = lsd;
+        const variables = params.get("variables") || "";
+        if (lsd) capturedMeta.lsdToken = lsd;
         if (docId) {
-          if (friendly.includes("PostsTab") || friendly.includes("Timeline")) {
-            graphqlCapture.postsDocId = docId;
-          } else if (friendly.includes("ReelsTab") || friendly.includes("Clips")) {
-            graphqlCapture.reelsDocId = docId;
+          if (
+            friendly.includes("PostsTab") ||
+            friendly.includes("Timeline") ||
+            friendly.includes("ProfilePosts")
+          ) {
+            capturedMeta.postsDocId = docId;
+          } else if (
+            friendly.includes("ReelsTab") ||
+            friendly.includes("Clips") ||
+            (variables.includes("target_user_id") && variables.includes("page_size"))
+          ) {
+            capturedMeta.reelsDocId = docId;
           }
         }
+        emitToContent("META_UPDATE", { meta: getSessionMeta() });
       }
     } catch (_) {}
   }
@@ -77,13 +95,16 @@
       const reqBody = args[1]?.body;
       if (typeof reqBody === "string") {
         inspectRequestForGraphqlMeta(reqUrl, reqBody);
-      } else {
-        inspectRequestForGraphqlMeta(reqUrl, "");
       }
     } catch (_) {}
 
     const response = await origFetch.apply(this, args);
     try {
+      const claim = response.headers?.get?.("x-ig-set-www-claim");
+      if (claim) {
+        capturedMeta.wwwClaim = claim;
+        try { sessionStorage.setItem("www-claim-v2", claim); } catch (_) {}
+      }
       const reqUrl = typeof args[0] === "string" ? args[0] : (args[0]?.url || "");
       if (
         reqUrl.includes("/graphql") ||
@@ -95,7 +116,11 @@
           const t = txt.trim();
           if (t.startsWith("{") || t.startsWith("[")) {
             try {
-              emitToContent("INTERCEPTED_JSON", { url: reqUrl, payload: JSON.parse(t) });
+              emitToContent("INTERCEPTED_JSON", {
+                url: reqUrl,
+                payload: JSON.parse(t),
+                meta: getSessionMeta()
+              });
             } catch (_) {}
           }
         }).catch(() => {});
@@ -121,11 +146,20 @@
 
     this.addEventListener("load", function () {
       try {
+        const claim = this.getResponseHeader?.("x-ig-set-www-claim");
+        if (claim) {
+          capturedMeta.wwwClaim = claim;
+          try { sessionStorage.setItem("www-claim-v2", claim); } catch (_) {}
+        }
         const url = this.__isUrl || "";
         if (url.includes("/graphql") || url.includes("/api/v1/") || url.includes("query")) {
           const t = (this.responseText || "").trim();
           if (t.startsWith("{") || t.startsWith("[")) {
-            emitToContent("INTERCEPTED_JSON", { url, payload: JSON.parse(t) });
+            emitToContent("INTERCEPTED_JSON", {
+              url,
+              payload: JSON.parse(t),
+              meta: getSessionMeta()
+            });
           }
         }
       } catch (_) {}
@@ -136,100 +170,42 @@
   async function mainWorldJsonFetch(url, options = {}) {
     try {
       const lsd = getLsdToken();
+      const csrf = getCsrfToken();
+      const claim = sessionStorage.getItem("www-claim-v2") || capturedMeta.wwwClaim || "0";
+
       const headers = {
         "x-ig-app-id": IG_APP_ID,
-        "x-csrftoken": getCsrfToken(),
+        "x-csrftoken": csrf,
         "x-requested-with": "XMLHttpRequest",
-        "x-asbd-id": "129477",
-        "x-ig-www-claim": sessionStorage.getItem("www-claim-v2") || "0",
+        "x-asbd-id": capturedMeta.asbdId || "129477",
+        "x-ig-www-claim": claim,
         "accept": "*/*",
         ...(options.headers || {})
       };
       if (lsd) headers["x-fb-lsd"] = lsd;
 
-      const res = await origFetch(url, {
-        ...options,
+      const fetchOpts = {
+        method: options.method || "GET",
         headers,
         credentials: "include"
-      });
+      };
+      if (options.body) fetchOpts.body = options.body;
+
+      const res = await origFetch(url, fetchOpts);
+      const newClaim = res.headers?.get?.("x-ig-set-www-claim");
+      if (newClaim) {
+        capturedMeta.wwwClaim = newClaim;
+        try { sessionStorage.setItem("www-claim-v2", newClaim); } catch (_) {}
+      }
+
       if (!res.ok) return { ok: false, status: res.status, data: null };
       const txt = (await res.text()).trim();
       if (!txt.startsWith("{") && !txt.startsWith("[")) {
         return { ok: false, status: res.status, data: null };
       }
       return { ok: true, status: res.status, data: JSON.parse(txt) };
-    } catch (_) {
-      return { ok: false, status: 0, data: null };
-    }
-  }
-
-  async function fetchPostsViaGraphqlConnection(username, afterCursor) {
-    const variables = {
-      data: {
-        count: 12,
-        include_relationship_info: true,
-        latest_besties_reel_media: true,
-        latest_reel_media: true
-      },
-      username: String(username),
-      __relay_internal__pv__PolarisIsLoggedInrelayprovider: true,
-      __relay_internal__pv__PolarisShareSheetV3relayprovider: true
-    };
-    if (afterCursor) {
-      variables.after = String(afterCursor);
-      variables.first = 12;
-      variables.last = null;
-      variables.before = null;
-    }
-
-    const body = new URLSearchParams();
-    const lsd = getLsdToken();
-    if (lsd) body.set("lsd", lsd);
-    body.set("fb_api_req_friendly_name", "PolarisProfilePostsTabContentQuery_connection");
-    body.set("variables", JSON.stringify(variables));
-    body.set("server_timestamps", "true");
-    body.set("doc_id", graphqlCapture.postsDocId);
-
-    const postRes = await mainWorldJsonFetch("https://www.instagram.com/graphql/query", {
-      method: "POST",
-      headers: {
-        "content-type": "application/x-www-form-urlencoded",
-        "x-fb-friendly-name": "PolarisProfilePostsTabContentQuery_connection"
-      },
-      body: body.toString()
-    });
-
-    if (postRes.ok && postRes.data?.data?.xdt_api__v1__feed__user_timeline_graphql_connection) {
-      return postRes;
-    }
-
-    const getUrl = new URL("https://www.instagram.com/graphql/query/");
-    getUrl.searchParams.set("doc_id", graphqlCapture.postsDocId);
-    getUrl.searchParams.set("variables", JSON.stringify(variables));
-    return await mainWorldJsonFetch(getUrl.toString());
-  }
-
-  async function convertImageFormatInMainWorld(url, targetFormat) {
-    try {
-      const res = await origFetch(url);
-      if (!res.ok) return null;
-      const blob = await res.blob();
-      const bitmap = await createImageBitmap(blob);
-      const canvas = document.createElement("canvas");
-      canvas.width = bitmap.width;
-      canvas.height = bitmap.height;
-      const ctx = canvas.getContext("2d");
-      if (targetFormat === "jpg") {
-        ctx.fillStyle = "#FFFFFF";
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-      }
-      ctx.drawImage(bitmap, 0, 0);
-      const mime = targetFormat === "png" ? "image/png" : "image/jpeg";
-      const dataUrl = canvas.toDataURL(mime, 0.96);
-      if (!dataUrl || !dataUrl.startsWith(`data:${mime}`)) return null;
-      return dataUrl;
-    } catch (_) {
-      return null;
+    } catch (err) {
+      return { ok: false, status: 0, error: String(err), data: null };
     }
   }
 
@@ -237,43 +213,18 @@
     if (event.source !== window || event.data?.source !== "INSTASWIFT_CONTENT") return;
     const { cmd, reqId, payload } = event.data;
 
-    if (cmd === "FETCH_WEB_PROFILE_INFO") {
+    if (cmd === "GET_SESSION_META") {
+      emitToContent("CMD_RESPONSE", { reqId, result: { ok: true, meta: getSessionMeta() } });
+    }
+    else if (cmd === "MAIN_WORLD_FETCH") {
+      const { url, options } = payload;
+      const result = await mainWorldJsonFetch(url, options || {});
+      emitToContent("CMD_RESPONSE", { reqId, result });
+    }
+    else if (cmd === "FETCH_WEB_PROFILE_INFO") {
       const { username } = payload;
       const url = `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`;
       const result = await mainWorldJsonFetch(url);
-      emitToContent("CMD_RESPONSE", { reqId, result });
-    }
-    else if (cmd === "FETCH_POSTS_GRAPHQL") {
-      const { username, afterCursor } = payload;
-      const result = await fetchPostsViaGraphqlConnection(username, afterCursor);
-      emitToContent("CMD_RESPONSE", { reqId, result });
-    }
-    else if (cmd === "FETCH_POSTS_REST") {
-      const { username, userId, maxId } = payload;
-      let url;
-      if (userId) {
-        url = new URL(`https://www.instagram.com/api/v1/feed/user/${encodeURIComponent(userId)}/`);
-      } else {
-        url = new URL(`https://www.instagram.com/api/v1/feed/user/${encodeURIComponent(username)}/username/`);
-      }
-      url.searchParams.set("count", "33");
-      if (maxId) url.searchParams.set("max_id", maxId);
-      const result = await mainWorldJsonFetch(url.toString());
-      emitToContent("CMD_RESPONSE", { reqId, result });
-    }
-    else if (cmd === "FETCH_REELS_PAGE") {
-      const { userId, maxId } = payload;
-      const body = new URLSearchParams({
-        target_user_id: String(userId),
-        page_size: "24",
-        include_feed_video: "true"
-      });
-      if (maxId) body.set("max_id", maxId);
-      const result = await mainWorldJsonFetch("https://www.instagram.com/api/v1/clips/user/", {
-        method: "POST",
-        headers: { "content-type": "application/x-www-form-urlencoded" },
-        body: body.toString()
-      });
       emitToContent("CMD_RESPONSE", { reqId, result });
     }
     else if (cmd === "FETCH_MEDIA_INFO") {
@@ -301,11 +252,6 @@
       url.searchParams.set("reel_ids", String(reelId));
       const result = await mainWorldJsonFetch(url.toString());
       emitToContent("CMD_RESPONSE", { reqId, result });
-    }
-    else if (cmd === "CONVERT_IMAGE_DATAURL") {
-      const { url, format } = payload;
-      const dataUrl = await convertImageFormatInMainWorld(url, format);
-      emitToContent("CMD_RESPONSE", { reqId, result: { ok: Boolean(dataUrl), dataUrl } });
     }
   });
 })();

@@ -16,9 +16,10 @@ function refreshPopupStats() {
   chrome.runtime.sendMessage({ action: "GET_STATS" }, (stats) => {
     if (chrome.runtime.lastError || !stats) return;
     document.getElementById("p-status").textContent =
-      `Status: ${stats.status}` + (stats.username ? ` (@${stats.username})` : "");
-    document.getElementById("p-posts").textContent = stats.gridPostsFiles || 0;
-    document.getElementById("p-reels").textContent = stats.reelsOnlyFiles || 0;
+      `${stats.status}` + (stats.username ? ` (@${stats.username}) — Saved: ${stats.savedToDisk}/${stats.totalQueued}` : "");
+    document.getElementById("p-posts").textContent =
+      stats.expectedPosts > 0 ? `${stats.gridPostsMatched}/${stats.expectedPosts}` : (stats.gridPostsMatched || 0);
+    document.getElementById("p-reels").textContent = stats.uniqueReelsMatched || 0;
   });
 }
 
@@ -34,4 +35,4 @@ document.getElementById("p-trigger").addEventListener("click", () => {
 });
 
 refreshPopupStats();
-setInterval(refreshPopupStats, 700);
+setInterval(refreshPopupStats, 600);

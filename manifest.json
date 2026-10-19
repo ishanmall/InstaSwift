@@ -1,12 +1,17 @@
 {
   "manifest_version": 3,
-  "name": "InstaSwift v10.0 - Clean Grid & Reels Downloader",
-  "version": "10.0.0",
-  "description": "Simple 2-section Instagram downloader: 1) Main Posts Grid 2) Reels Tab with strict cross-tab deduplication.",
+  "name": "InstaSwift v16.0 - Tab-Independent Background Grid, Reels & HD Story Downloader",
+  "version": "16.0.0",
+  "minimum_chrome_version": "109",
+  "description": "Works from ANY tab (/reels/ or Main Grid)! Scans 100% Grid Posts & Unique Reels in Background + Zero Duplicates.",
   "permissions": [
     "downloads",
     "storage",
-    "activeTab"
+    "activeTab",
+    "tabs",
+    "alarms",
+    "offscreen",
+    "cookies"
   ],
   "host_permissions": [
     "https://*.instagram.com/*",
@@ -32,6 +37,6 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "InstaSwift v10.0"
+    "default_title": "InstaSwift v16.0"
   }
 }
