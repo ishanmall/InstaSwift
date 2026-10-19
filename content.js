@@ -7,6 +7,30 @@ let latestSessionMeta = {
   reelsDocId: "7898261790222653"
 };
 
+// Keep Instagram Content Tab Awake via Web Lock + Silent Tab Audio Context when job runs
+let tabAudioCtx = null;
+function activateTabWakeLock() {
+  try {
+    if (navigator.locks && navigator.locks.request) {
+      navigator.locks.request("instaswift_tab_active_lock", () => new Promise(() => {}));
+    }
+    if (!tabAudioCtx) {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (AudioCtx) {
+        tabAudioCtx = new AudioCtx();
+        const osc = tabAudioCtx.createOscillator();
+        const gain = tabAudioCtx.createGain();
+        gain.gain.value = 0.00001;
+        osc.connect(gain);
+        gain.connect(tabAudioCtx.destination);
+        osc.start();
+      }
+    } else if (tabAudioCtx.state === "suspended") {
+      tabAudioCtx.resume().catch(() => {});
+    }
+  } catch (_) {}
+}
+
 const mediaCacheByShortcode = new Map();
 const storyItemsByPk = new Map();
 const storyTraysByUser = new Map();
@@ -195,7 +219,7 @@ function collectEmbeddedPageJsonPayloads(usernameLower) {
 }
 
 // =========================================================
-// 1. PROFILE BUTTON & FORMAT SELECTOR (WORKS FROM MAIN GRID OR /REELS/ TAB!)
+// 1. PROFILE BUTTON & FORMAT SELECTOR
 // =========================================================
 function injectProfileButton() {
   const username = getUsernameFromUrl();
@@ -211,8 +235,9 @@ function injectProfileButton() {
   const btn = document.createElement("button");
   btn.id = "instaswift-download-btn";
   btn.className = "instaswift-btn";
-  btn.innerHTML = "⚡ Download All (Works in Background)";
+  btn.innerHTML = "⚡ Download All (Works Minimized / Background)";
   btn.addEventListener("click", () => {
+    activateTabWakeLock();
     const currentUsername = getUsernameFromUrl();
     if (currentUsername) triggerBackgroundAutonomousJob(currentUsername);
   });
@@ -238,6 +263,8 @@ function injectProfileButton() {
 }
 
 async function triggerBackgroundAutonomousJob(username) {
+  activateTabWakeLock();
+
   if (
     document.body.innerText.includes("This account is private") ||
     document.body.innerText.includes("This Account is Private")
@@ -252,16 +279,15 @@ async function triggerBackgroundAutonomousJob(username) {
 
   createOrShowHUD(username);
 
-  // If user clicked "Download All" while standing on /reels/ or /tagged/, automatically switch SPA tab to Main Grid first so IG loads Grid cursor!
   if (currentSubTab !== "posts") {
-    updateHUDStatus(`🔄 Switching from /${currentSubTab}/ to Main Grid & starting full 100% scan...`);
+    updateHUDStatus(`🔄 Switching from /${currentSubTab}/ to Main Grid & starting Anti-Freeze Scan...`);
     const mainGridTabLink = document.querySelector(`a[href="/${username}/"], a[href="/${userLower}/"]`);
     if (mainGridTabLink) {
       mainGridTabLink.click();
       await new Promise((r) => setTimeout(r, 900));
     }
   } else {
-    updateHUDStatus("🚀 Background Engine started! Switch to any tab — scanning & downloading runs 100% in background.");
+    updateHUDStatus("🚀 Anti-Freeze Engine Active! Minimize Chrome to VS Code or switch tabs freely.");
   }
 
   const metaRes = await callMainWorld("GET_SESSION_META", {}, 3000);
@@ -695,7 +721,7 @@ function createOrShowHUD(username) {
     hud.id = "instaswift-hud";
     hud.innerHTML = `
       <div class="is-hud-header">
-        <span class="is-hud-title">⚡ InstaSwift v16 — <strong id="is-hud-user">@${username}</strong></span>
+        <span class="is-hud-title">⚡ InstaSwift v17 — <strong id="is-hud-user">@${username}</strong></span>
         <button id="is-hud-close" title="Close">✕</button>
       </div>
       <div class="is-hud-status" id="is-hud-status">Ready</div>
@@ -709,7 +735,7 @@ function createOrShowHUD(username) {
           <span class="is-stat-lbl">2. Reels Section (Unique)</span>
         </div>
       </div>
-      <div class="is-hud-sub" id="is-hud-sub">PC Disk Saved: 0 / 0 files (Runs in Background!)</div>
+      <div class="is-hud-sub" id="is-hud-sub">PC Disk Saved: 0 / 0 files (Anti-Freeze Active!)</div>
       <div class="is-hud-actions">
         <button id="is-hud-stop" class="is-stop-btn">Stop</button>
       </div>
@@ -760,10 +786,10 @@ function renderStatsToHUD(stats) {
   if (btn) {
     if (stats.isRunning) {
       btn.disabled = true;
-      btn.textContent = "⚡ Running in Background...";
+      btn.textContent = "⚡ Running (Anti-Freeze Active)...";
     } else {
       btn.disabled = false;
-      btn.textContent = "⚡ Download All (Works in Background)";
+      btn.textContent = "⚡ Download All (Works Minimized / Background)";
     }
   }
 }
@@ -779,6 +805,7 @@ try {
       return false;
     }
     else if (msg.action === "TRIGGER_FROM_POPUP") {
+      activateTabWakeLock();
       if (msg.format) {
         preferredImageFormat = msg.format;
         const sel = document.getElementById("instaswift-fmt-select");
@@ -790,15 +817,17 @@ try {
       return false;
     }
     else if (msg.action === "EXEC_MAIN_WORLD_FETCH") {
+      activateTabWakeLock();
       callMainWorld("MAIN_WORLD_FETCH", { url: msg.url, options: msg.options || {} }, msg.timeoutMs || 15000)
         .then((res) => sendResponse(res))
         .catch(() => sendResponse({ ok: false, status: 0, data: null }));
       return true;
     }
     else if (msg.action === "EXEC_SWITCH_TAB_AND_SCROLL") {
+      activateTabWakeLock();
       (async () => {
         try {
-          const targetTab = msg.tabType || "posts"; // "posts" or "reels"
+          const targetTab = msg.tabType || "posts";
           const user = msg.username || getUsernameFromUrl() || "";
           if (targetTab === "posts") {
             const link = document.querySelector(`a[href="/${user}/"]`);
@@ -808,7 +837,7 @@ try {
             if (link && !window.location.pathname.includes("/reels")) link.click();
           }
           window.scrollTo(0, document.body.scrollHeight);
-          await new Promise((r) => setTimeout(r, 400));
+          await new Promise((r) => setTimeout(r, 350));
           sendResponse({ ok: true, meta: latestSessionMeta });
         } catch (_) {
           sendResponse({ ok: false });

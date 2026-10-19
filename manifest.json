@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "InstaSwift v16.0 - Tab-Independent Background Grid, Reels & HD Story Downloader",
-  "version": "16.0.0",
+  "name": "InstaSwift v17.0 - Anti-Freeze Background Profile, Reels & HD Story Downloader",
+  "version": "17.0.0",
   "minimum_chrome_version": "109",
-  "description": "Works from ANY tab (/reels/ or Main Grid)! Scans 100% Grid Posts & Unique Reels in Background + Zero Duplicates.",
+  "description": "Never freezes when Chrome is minimized to VS Code! Continuous Audio/WebLock Wake Engine + 100% Grid & Reels Scanner.",
   "permissions": [
     "downloads",
     "storage",
@@ -11,7 +11,8 @@
     "tabs",
     "alarms",
     "offscreen",
-    "cookies"
+    "cookies",
+    "idle"
   ],
   "host_permissions": [
     "https://*.instagram.com/*",
@@ -37,6 +38,6 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "InstaSwift v16.0"
+    "default_title": "InstaSwift v17.0"
   }
 }

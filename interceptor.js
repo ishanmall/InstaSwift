@@ -1,6 +1,6 @@
 (function () {
-  if (window.__instaswiftV16Loaded) return;
-  window.__instaswiftV16Loaded = true;
+  if (window.__instaswiftV17Loaded) return;
+  window.__instaswiftV17Loaded = true;
 
   const IG_APP_ID = "936619743392459";
 

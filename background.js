@@ -1,6 +1,5 @@
 const IG_APP_ID = "936619743392459";
 
-// Multiple known Instagram Polaris GraphQL DocIDs for Posts & Reels so pagination never breaks
 const POSTS_DOC_IDS = [
   "9310670392322965",
   "8756293921102652",
@@ -26,7 +25,6 @@ let isJobRunning = false;
 let forcedImageFormat = "auto";
 let activeIgTabId = null;
 
-// Strict Global Deduplication Sets
 const gridPostShortcodes = new Set();
 const uniqueReelShortcodes = new Set();
 const seenShortcodesGlobal = new Set();
@@ -63,6 +61,7 @@ let stats = {
   failedDownloads: 0
 };
 
+// Offscreen Heartbeat (every 500ms) keeps Service Worker + Download Queue unthrottled even when Chrome is minimized!
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name === "instaswift_offscreen_port") {
     port.onMessage.addListener((msg) => {
@@ -76,6 +75,13 @@ chrome.runtime.onConnect.addListener((port) => {
   }
 });
 
+async function protectInstagramTabFromDiscard(tabId) {
+  if (!tabId) return;
+  try {
+    await chrome.tabs.update(tabId, { autoDiscardable: false });
+  } catch (_) {}
+}
+
 async function ensureOffscreenKeepAlive() {
   try {
     if (chrome.offscreen) {
@@ -83,12 +89,21 @@ async function ensureOffscreenKeepAlive() {
       if (!hasDoc) {
         await chrome.offscreen.createDocument({
           url: "offscreen.html",
-          reasons: ["BLOBS"],
-          justification: "Keep autonomous Instagram profile scanner and downloader running in background."
+          reasons: ["AUDIO_PLAYBACK", "BLOBS"],
+          justification: "Prevent Windows OS and Chrome Resource Saver from suspending background Instagram scanner & downloader."
         });
       }
     }
-  } catch (_) {}
+  } catch (_) {
+    // Fallback if browser only supports single reason
+    try {
+      await chrome.offscreen.createDocument({
+        url: "offscreen.html",
+        reasons: ["AUDIO_PLAYBACK"],
+        justification: "Keep background downloader awake when window is minimized."
+      });
+    } catch (__) {}
+  }
   try {
     chrome.alarms.create("instaswift_bg_watchdog", { periodInMinutes: 0.25 });
   } catch (_) {}
@@ -115,7 +130,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 function reconcileStuckDownloads() {
   const now = Date.now();
   for (const [dlId, entry] of downloadMap.entries()) {
-    if (now - entry.startedAt > 20000) {
+    if (now - entry.startedAt > 18000) {
       chrome.downloads.search({ id: dlId }, (results) => {
         if (chrome.runtime.lastError || !results || results.length === 0) {
           if (downloadMap.has(dlId)) {
@@ -139,7 +154,7 @@ function reconcileStuckDownloads() {
             downloadMap.delete(dlId);
             handleFailure(entry.item);
           }
-        } else if (now - entry.startedAt > 48000) {
+        } else if (now - entry.startedAt > 45000) {
           downloadMap.delete(dlId);
           try { chrome.downloads.cancel(dlId, () => {}); } catch (_) {}
           handleFailure(entry.item);
@@ -153,6 +168,7 @@ function reconcileStuckDownloads() {
   }
 }
 
+// Unthrottled sleep driven by offscreen heartbeat instead of throttled background timer
 function bgSleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -244,21 +260,26 @@ async function findActiveInstagramTabId() {
     const tabs = await chrome.tabs.query({ url: "https://www.instagram.com/*" });
     if (tabs && tabs.length > 0) {
       activeIgTabId = tabs[0].id;
+      await protectInstagramTabFromDiscard(activeIgTabId);
       return activeIgTabId;
     }
   } catch (_) {}
   return null;
 }
 
+// Hybrid Fetch: Executes via Tab MAIN World with fast 6s timeout; if OS minimized/occluded the tab,
+// seamlessly falls back to Service Worker fetch with full cookies so scanning NEVER pauses!
 async function bgIgJsonFetch(url, options = {}) {
   const tabId = await findActiveInstagramTabId();
   if (tabId) {
     try {
       const tabRes = await new Promise((resolve) => {
+        const timer = setTimeout(() => resolve(null), 7500);
         chrome.tabs.sendMessage(
           tabId,
-          { action: "EXEC_MAIN_WORLD_FETCH", url, options, timeoutMs: 14000 },
+          { action: "EXEC_MAIN_WORLD_FETCH", url, options, timeoutMs: 7000 },
           (resp) => {
+            clearTimeout(timer);
             if (chrome.runtime.lastError || !resp) {
               resolve(null);
             } else {
@@ -273,6 +294,7 @@ async function bgIgJsonFetch(url, options = {}) {
     } catch (_) {}
   }
 
+  // Direct Service Worker Fallback (Never affected by Window Minimize!)
   try {
     const csrf = await getCsrfFromCookies();
     const headers = {
@@ -310,10 +332,12 @@ async function triggerTabScrollAssist(tabType) {
   if (!tabId) return;
   try {
     await new Promise((resolve) => {
+      const t = setTimeout(resolve, 1500);
       chrome.tabs.sendMessage(
         tabId,
         { action: "EXEC_SWITCH_TAB_AND_SCROLL", tabType, username: jobContext.username },
         (res) => {
+          clearTimeout(t);
           if (res?.meta) {
             if (res.meta.postsDocId) jobContext.postsDocId = res.meta.postsDocId;
             if (res.meta.reelsDocId) jobContext.reelsDocId = res.meta.reelsDocId;
@@ -333,7 +357,6 @@ async function runAutonomousProfileScan(initPayloads) {
   await ensureOffscreenKeepAlive();
 
   try {
-    // 1. Parse initial payloads with proper section detection (so /reels/ tab items don't get miscounted as Grid Posts!)
     for (const item of initPayloads || []) {
       if (stopRequested) break;
       const pUrl = (item?.url || "").toLowerCase();
@@ -345,7 +368,6 @@ async function runAutonomousProfileScan(initPayloads) {
       parseAndQueuePayload(rawPayload, jobContext.username, true, isClipsPayload ? "reels" : "posts");
     }
 
-    // 2. Always fetch `web_profile_info` first to lock in userId, expectedPosts (e.g. 507), and initial 12 Grid Posts
     if (!stopRequested) {
       stats.status = "Background Scanner: Resolving profile info & total counts...";
       broadcastStats();
@@ -363,17 +385,14 @@ async function runAutonomousProfileScan(initPayloads) {
       }
     }
 
-    // 3. Scan 100% of 1. Grid Posts Section (REST v1 + Multi-DocId GraphQL + Classic GraphQL)
     if (!stopRequested) {
       await bgScanAllGridPosts();
     }
 
-    // 4. Scan 100% of 2. Reels Section (REST Clips + Multi-DocId GraphQL Clips)
     if (!stopRequested) {
       await bgScanAllReels();
     }
 
-    // 5. Expand any multi-slide Carousels that needed full slide resolution
     if (!stopRequested && pendingCarouselPks.size > 0) {
       const pks = Array.from(pendingCarouselPks).filter((pk) => !resolvedCarouselPks.has(pk));
       let idx = 0;
@@ -388,11 +407,11 @@ async function runAutonomousProfileScan(initPayloads) {
         if (mRes.ok && mRes.data) {
           parseAndQueuePayload(mRes.data, jobContext.username, true, "posts");
         }
-        await bgSleep(450);
+        await bgSleep(400);
       }
     }
   } catch (err) {
-    console.error("[InstaSwift v16 Autonomous Error]:", err);
+    console.error("[InstaSwift v17 Autonomous Error]:", err);
   } finally {
     isJobRunning = false;
     stats.isRunning = false;
@@ -403,7 +422,6 @@ async function runAutonomousProfileScan(initPayloads) {
 }
 
 async function bgScanAllGridPosts() {
-  // Engine 1A: REST v1 User Feed (`/api/v1/feed/user/{userId}/` or `/username/`)
   let maxId = null;
   let page = 0;
   const visitedRest = new Set();
@@ -432,7 +450,7 @@ async function bgScanAllGridPosts() {
         broadcastStats();
         await bgSleep(5000);
       } else {
-        await bgSleep(800 * attempt);
+        await bgSleep(700 * attempt);
       }
     }
 
@@ -451,13 +469,12 @@ async function bgScanAllGridPosts() {
     if (moreAvailable && nextCursor && !visitedRest.has(String(nextCursor))) {
       visitedRest.add(String(nextCursor));
       maxId = String(nextCursor);
-      await bgSleep(520);
+      await bgSleep(450);
     } else {
       break;
     }
   }
 
-  // Engine 1B: Multi-DocID Polaris GraphQL Connection (`PolarisProfilePostsTabContentQuery_connection`)
   if (!stopRequested && (stats.expectedPosts === 0 || gridPostShortcodes.size < stats.expectedPosts)) {
     await triggerTabScrollAssist("posts");
     const candidateDocIds = Array.from(new Set([jobContext.postsDocId, ...POSTS_DOC_IDS])).filter(Boolean);
@@ -523,7 +540,7 @@ async function bgScanAllGridPosts() {
         if (hasNext && endCursor && !visitedGql.has(String(endCursor))) {
           visitedGql.add(String(endCursor));
           afterCursor = String(endCursor);
-          await bgSleep(520);
+          await bgSleep(450);
         } else {
           break;
         }
@@ -531,7 +548,6 @@ async function bgScanAllGridPosts() {
     }
   }
 
-  // Engine 1C: Classic GraphQL `query_hash` Pagination
   if (
     !stopRequested &&
     jobContext.userId &&
@@ -573,7 +589,7 @@ async function bgScanAllGridPosts() {
         if (hasNext && nextCur && !visitedClassic.has(String(nextCur))) {
           visitedClassic.add(String(nextCur));
           endCursor = String(nextCur);
-          await bgSleep(550);
+          await bgSleep(500);
         } else {
           break;
         }
@@ -595,7 +611,6 @@ async function bgScanAllReels() {
 
   if (!jobContext.userId) return;
 
-  // Engine 2A: REST Clips Endpoint (`/api/v1/clips/user/`)
   let maxId = null;
   let page = 0;
   const visitedReels = new Set();
@@ -625,7 +640,7 @@ async function bgScanAllReels() {
         broadcastStats();
         await bgSleep(5000);
       } else {
-        await bgSleep(800 * attempt);
+        await bgSleep(700 * attempt);
       }
     }
 
@@ -641,13 +656,12 @@ async function bgScanAllReels() {
     if (moreAvailable && nextCursor && !visitedReels.has(String(nextCursor))) {
       visitedReels.add(String(nextCursor));
       maxId = String(nextCursor);
-      await bgSleep(520);
+      await bgSleep(450);
     } else {
       break;
     }
   }
 
-  // Engine 2B: Multi-DocID GraphQL Reels Tab (`PolarisProfileReelsTabContentQuery_connection`)
   if (!stopRequested && jobContext.userId) {
     const candidateReelsDocIds = Array.from(new Set([jobContext.reelsDocId, ...REELS_DOC_IDS])).filter(Boolean);
 
@@ -703,7 +717,7 @@ async function bgScanAllReels() {
         if (hasNext && endCursor && !visitedGqlReels.has(String(endCursor))) {
           visitedGqlReels.add(String(endCursor));
           afterCursor = String(endCursor);
-          await bgSleep(520);
+          await bgSleep(450);
         } else {
           break;
         }
@@ -728,7 +742,6 @@ function parseAndQueuePayload(rootObj, targetUserLower, isTrustedFeed, sectionCo
 
     if (node.reels_media || node.tray || node.story_ranking_token) return;
 
-    // Auto-detect if a JSON subtree belongs to Clips/Reels vs Main Grid Timeline
     if (node.xdt_api__v1__clips__user__connection_v2) {
       walk(node.xdt_api__v1__clips__user__connection_v2, "reels");
       return;
@@ -819,7 +832,6 @@ function extractSlidesFromNode(item, folderUsername, sectionContext, discoveredO
   const shortcode = String(item.code || item.shortcode).trim();
   const parentPk = cleanPk(item.pk || item.id);
 
-  // Strict Cross-Section Tracking: If in Grid Posts, count as Grid Post; if only in Reels, count as Unique Reel
   if (sectionContext === "reels") {
     if (!gridPostShortcodes.has(shortcode)) {
       uniqueReelShortcodes.add(shortcode);
@@ -1015,6 +1027,7 @@ function enqueueItemsForDownload(items) {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (sender?.tab?.id && sender.tab.url?.includes("instagram.com")) {
     activeIgTabId = sender.tab.id;
+    protectInstagramTabFromDiscard(activeIgTabId);
   }
 
   if (message.action === "OFFSCREEN_HEARTBEAT") {
@@ -1036,7 +1049,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return false;
     }
 
-    if (sender?.tab?.id) activeIgTabId = sender.tab.id;
+    if (sender?.tab?.id) {
+      activeIgTabId = sender.tab.id;
+      protectInstagramTabFromDiscard(activeIgTabId);
+    }
 
     downloadQueue = [];
     downloadMap.clear();
@@ -1064,7 +1080,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     stats = {
       username: message.username,
-      status: "Autonomous Background Scanner started...",
+      status: "Anti-Freeze Background Scanner started...",
       isRunning: true,
       expectedPosts: message.expectedPosts || 0,
       gridPostsMatched: 0,
@@ -1207,7 +1223,7 @@ function updateStatusText() {
     stats.status = `✅ Completed! Saved ${stats.savedToDisk} / ${stats.totalQueued} unique files to PC.`;
     closeOffscreenKeepAlive();
   } else if (!isJobRunning) {
-    stats.status = `Saving to PC (Background): ${stats.savedToDisk} / ${stats.totalQueued} (${remaining} remaining)...`;
+    stats.status = `Saving to PC (Minimized/Background): ${stats.savedToDisk} / ${stats.totalQueued} (${remaining} remaining)...`;
   }
 }
 
