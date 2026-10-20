@@ -1,10 +1,7 @@
-// 1. Permanent Web Lock so Chromium never collects the offscreen document
 if (navigator.locks && navigator.locks.request) {
-  navigator.locks.request("instaswift_v17_os_wakelock", () => new Promise(() => {}));
+  navigator.locks.request("instaswift_os_wakelock", () => new Promise(() => {}));
 }
 
-// 2. Ultra-quiet (inaudible) WebAudio loop so Windows OS & Chrome Resource Saver
-// treat the browser process as playing active audio and NEVER freeze it when minimized to VS Code!
 let audioCtx = null;
 function startSilentAudioWakeLock() {
   try {
@@ -14,7 +11,6 @@ function startSilentAudioWakeLock() {
     audioCtx = new AudioContextClass();
     const osc = audioCtx.createOscillator();
     const gain = audioCtx.createGain();
-    // 0.00001 gain is completely inaudible to speakers/headphones but keeps Windows Multimedia thread active
     gain.gain.value = 0.00001;
     osc.frequency.value = 1;
     osc.connect(gain);
@@ -24,7 +20,6 @@ function startSilentAudioWakeLock() {
 }
 startSilentAudioWakeLock();
 
-// 3. High-frequency persistent port + MessageChannel pulse (bypasses timer throttling)
 let port = null;
 function connectPort() {
   try {

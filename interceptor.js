@@ -1,6 +1,6 @@
 (function () {
-  if (window.__instaswiftV17Loaded) return;
-  window.__instaswiftV17Loaded = true;
+  if (window.__instaswiftLoaded) return;
+  window.__instaswiftLoaded = true;
 
   const IG_APP_ID = "936619743392459";
 
@@ -9,7 +9,9 @@
     reelsDocId: "7898261790222653",
     lsdToken: "",
     wwwClaim: "0",
-    asbdId: "129477"
+    asbdId: "129477",
+    postsReqTemplate: "",
+    reelsReqTemplate: ""
   };
 
   function getCsrfToken() {
@@ -35,7 +37,9 @@
       wwwClaim: sessionStorage.getItem("www-claim-v2") || capturedMeta.wwwClaim || "0",
       postsDocId: capturedMeta.postsDocId,
       reelsDocId: capturedMeta.reelsDocId,
-      asbdId: capturedMeta.asbdId
+      asbdId: capturedMeta.asbdId,
+      postsReqTemplate: capturedMeta.postsReqTemplate,
+      reelsReqTemplate: capturedMeta.reelsReqTemplate
     };
   }
 
@@ -67,20 +71,25 @@
         const docId = params.get("doc_id") || "";
         const lsd = params.get("lsd") || "";
         const variables = params.get("variables") || "";
+
         if (lsd) capturedMeta.lsdToken = lsd;
+
         if (docId) {
           if (
             friendly.includes("PostsTab") ||
             friendly.includes("Timeline") ||
-            friendly.includes("ProfilePosts")
+            friendly.includes("ProfilePosts") ||
+            (variables.includes('"username"') && variables.includes('"count"'))
           ) {
             capturedMeta.postsDocId = docId;
+            capturedMeta.postsReqTemplate = bodyStr;
           } else if (
             friendly.includes("ReelsTab") ||
             friendly.includes("Clips") ||
             (variables.includes("target_user_id") && variables.includes("page_size"))
           ) {
             capturedMeta.reelsDocId = docId;
+            capturedMeta.reelsReqTemplate = bodyStr;
           }
         }
         emitToContent("META_UPDATE", { meta: getSessionMeta() });
@@ -203,7 +212,7 @@
       if (!txt.startsWith("{") && !txt.startsWith("[")) {
         return { ok: false, status: res.status, data: null };
       }
-      return { ok: true, status: res.status, data: JSON.parse(txt) };
+      return { ok: true, status: res.status, data: JSON.parse(txt), meta: getSessionMeta() };
     } catch (err) {
       return { ok: false, status: 0, error: String(err), data: null };
     }

@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "InstaSwift v17.0 - Anti-Freeze Background Profile, Reels & HD Story Downloader",
-  "version": "17.0.0",
+  "name": "InstaSwift",
+  "version": "19.0.0",
   "minimum_chrome_version": "109",
-  "description": "Never freezes when Chrome is minimized to VS Code! Continuous Audio/WebLock Wake Engine + 100% Grid & Reels Scanner.",
+  "description": "Autonomous Background Profile, Reels & HD Story Downloader.",
   "permissions": [
     "downloads",
     "storage",
@@ -38,6 +38,6 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "InstaSwift v17.0"
+    "default_title": "InstaSwift"
   }
 }

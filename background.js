@@ -18,7 +18,7 @@ const FALLBACK_POSTS_QUERY_HASH = "e769aa130647d2354c40ea6a439bfc08";
 
 let downloadQueue = [];
 let activeDownloads = 0;
-const MAX_CONCURRENT_DOWNLOADS = 6;
+const MAX_CONCURRENT_DOWNLOADS = 4;
 
 let stopRequested = false;
 let isJobRunning = false;
@@ -33,6 +33,10 @@ const seenSlideKeysGlobal = new Set();
 const seenAssetIdsGlobal = new Set();
 const pendingCarouselPks = new Set();
 const resolvedCarouselPks = new Set();
+const discoveredDomShortcodes = new Map();
+
+let latestCapturedPostsCursor = null;
+let latestCapturedReelsCursor = null;
 
 const downloadMap = new Map();
 
@@ -43,7 +47,9 @@ let jobContext = {
   lsdToken: "",
   wwwClaim: "0",
   postsDocId: "9310670392322965",
-  reelsDocId: "7898261790222653"
+  reelsDocId: "7898261790222653",
+  postsReqTemplate: "",
+  reelsReqTemplate: ""
 };
 
 let stats = {
@@ -61,12 +67,11 @@ let stats = {
   failedDownloads: 0
 };
 
-// Offscreen Heartbeat (every 500ms) keeps Service Worker + Download Queue unthrottled even when Chrome is minimized!
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name === "instaswift_offscreen_port") {
     port.onMessage.addListener((msg) => {
       if (msg.type === "HEARTBEAT") {
-        reconcileStuckDownloads();
+        reconcileDownloads();
         if (downloadQueue.length > 0 && activeDownloads < MAX_CONCURRENT_DOWNLOADS) {
           processQueue();
         }
@@ -90,17 +95,16 @@ async function ensureOffscreenKeepAlive() {
         await chrome.offscreen.createDocument({
           url: "offscreen.html",
           reasons: ["AUDIO_PLAYBACK", "BLOBS"],
-          justification: "Prevent Windows OS and Chrome Resource Saver from suspending background Instagram scanner & downloader."
+          justification: "Keep background scanner and downloader running."
         });
       }
     }
   } catch (_) {
-    // Fallback if browser only supports single reason
     try {
       await chrome.offscreen.createDocument({
         url: "offscreen.html",
         reasons: ["AUDIO_PLAYBACK"],
-        justification: "Keep background downloader awake when window is minimized."
+        justification: "Keep background downloader awake."
       });
     } catch (__) {}
   }
@@ -121,54 +125,38 @@ async function closeOffscreenKeepAlive() {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === "instaswift_bg_watchdog") {
-    reconcileStuckDownloads();
+    reconcileDownloads();
     processQueue();
     broadcastStats();
   }
 });
 
-function reconcileStuckDownloads() {
-  const now = Date.now();
+// FIXED: Never cancels active downloads! Only checks if any finished/interrupted events were missed.
+function reconcileDownloads() {
   for (const [dlId, entry] of downloadMap.entries()) {
-    if (now - entry.startedAt > 18000) {
-      chrome.downloads.search({ id: dlId }, (results) => {
-        if (chrome.runtime.lastError || !results || results.length === 0) {
-          if (downloadMap.has(dlId)) {
-            downloadMap.delete(dlId);
-            handleFailure(entry.item);
-          }
-          return;
-        }
-        const dl = results[0];
-        if (dl.state === "complete") {
-          if (downloadMap.has(dlId)) {
-            downloadMap.delete(dlId);
-            activeDownloads = Math.max(0, downloadMap.size);
-            stats.savedToDisk++;
-            updateStatusText();
-            broadcastStats();
-            processQueue();
-          }
-        } else if (dl.state === "interrupted") {
-          if (downloadMap.has(dlId)) {
-            downloadMap.delete(dlId);
-            handleFailure(entry.item);
-          }
-        } else if (now - entry.startedAt > 45000) {
+    chrome.downloads.search({ id: dlId }, (results) => {
+      if (chrome.runtime.lastError || !results || results.length === 0) return;
+      const dl = results[0];
+      if (dl.state === "complete") {
+        if (downloadMap.has(dlId)) {
           downloadMap.delete(dlId);
-          try { chrome.downloads.cancel(dlId, () => {}); } catch (_) {}
+          activeDownloads = Math.max(0, downloadMap.size);
+          stats.savedToDisk++;
+          updateStatusText();
+          broadcastStats();
+          processQueue();
+        }
+      } else if (dl.state === "interrupted") {
+        if (downloadMap.has(dlId)) {
+          downloadMap.delete(dlId);
           handleFailure(entry.item);
         }
-      });
-    }
+      }
+    });
   }
-
-  if (activeDownloads !== downloadMap.size) {
-    activeDownloads = downloadMap.size;
-  }
+  activeDownloads = downloadMap.size;
 }
 
-// Unthrottled sleep driven by offscreen heartbeat instead of throttled background timer
 function bgSleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -176,6 +164,22 @@ function bgSleep(ms) {
 function cleanPk(raw) {
   if (!raw) return "";
   return String(raw).split("_")[0].trim();
+}
+
+function shortcodeToMediaPk(shortcode) {
+  try {
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let id = BigInt(0);
+    const cleanCode = String(shortcode).split("/")[0].trim();
+    for (let i = 0; i < Math.min(cleanCode.length, 11); i++) {
+      const idx = alphabet.indexOf(cleanCode[i]);
+      if (idx === -1) break;
+      id = id * BigInt(64) + BigInt(idx);
+    }
+    return id > 0n ? id.toString() : "";
+  } catch (_) {
+    return "";
+  }
 }
 
 function getNormalizedAssetId(url) {
@@ -190,6 +194,8 @@ function getNormalizedAssetId(url) {
 
 function detectExtensionHintFromUrl(url, mustBeVideo) {
   if (mustBeVideo) return "mp4";
+  if (forcedImageFormat === "png") return "png";
+  if (forcedImageFormat === "jpg") return "jpg";
   try {
     const pathname = new URL(url).pathname.toLowerCase();
     if (pathname.endsWith(".png")) return "png";
@@ -197,41 +203,6 @@ function detectExtensionHintFromUrl(url, mustBeVideo) {
   } catch (_) {}
   return "jpg";
 }
-
-function resolveExtensionFromMime(mime, item) {
-  if (item.extHint === "mp4" || (mime && mime.toLowerCase().includes("video/mp4"))) {
-    return "mp4";
-  }
-  if (forcedImageFormat === "png") return "png";
-  if (forcedImageFormat === "jpg") return "jpg";
-  const m = (mime || "").toLowerCase();
-  if (m.includes("image/png")) return "png";
-  if (m.includes("image/jpeg") || m.includes("image/jpg")) return "jpg";
-  if (m.includes("image/webp")) return "webp";
-  return item.extHint || "jpg";
-}
-
-chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
-  const entry = downloadMap.get(downloadItem.id);
-  if (!entry || !entry.item) {
-    suggest();
-    return;
-  }
-
-  try {
-    const tracked = entry.item;
-    const cleanUser = tracked.username.replace(/[^a-zA-Z0-9._-]/g, "_");
-    const baseName = tracked.baseFilename || tracked.filename.replace(/\.[^.]+$/, "");
-    const trueExt = resolveExtensionFromMime(downloadItem.mime, tracked);
-
-    suggest({
-      filename: `Instagram/${cleanUser}/${baseName}.${trueExt}`,
-      conflictAction: "overwrite"
-    });
-  } catch (_) {
-    suggest();
-  }
-});
 
 async function getCsrfFromCookies() {
   try {
@@ -267,22 +238,31 @@ async function findActiveInstagramTabId() {
   return null;
 }
 
-// Hybrid Fetch: Executes via Tab MAIN World with fast 6s timeout; if OS minimized/occluded the tab,
-// seamlessly falls back to Service Worker fetch with full cookies so scanning NEVER pauses!
+function syncMetaFromTab(meta) {
+  if (!meta) return;
+  if (meta.postsDocId) jobContext.postsDocId = meta.postsDocId;
+  if (meta.reelsDocId) jobContext.reelsDocId = meta.reelsDocId;
+  if (meta.lsdToken) jobContext.lsdToken = meta.lsdToken;
+  if (meta.wwwClaim && meta.wwwClaim !== "0") jobContext.wwwClaim = meta.wwwClaim;
+  if (meta.postsReqTemplate) jobContext.postsReqTemplate = meta.postsReqTemplate;
+  if (meta.reelsReqTemplate) jobContext.reelsReqTemplate = meta.reelsReqTemplate;
+}
+
 async function bgIgJsonFetch(url, options = {}) {
   const tabId = await findActiveInstagramTabId();
   if (tabId) {
     try {
       const tabRes = await new Promise((resolve) => {
-        const timer = setTimeout(() => resolve(null), 7500);
+        const timer = setTimeout(() => resolve(null), 9000);
         chrome.tabs.sendMessage(
           tabId,
-          { action: "EXEC_MAIN_WORLD_FETCH", url, options, timeoutMs: 7000 },
+          { action: "EXEC_MAIN_WORLD_FETCH", url, options, timeoutMs: 8500 },
           (resp) => {
             clearTimeout(timer);
             if (chrome.runtime.lastError || !resp) {
               resolve(null);
             } else {
+              if (resp.meta) syncMetaFromTab(resp.meta);
               resolve(resp);
             }
           }
@@ -294,7 +274,6 @@ async function bgIgJsonFetch(url, options = {}) {
     } catch (_) {}
   }
 
-  // Direct Service Worker Fallback (Never affected by Window Minimize!)
   try {
     const csrf = await getCsrfFromCookies();
     const headers = {
@@ -329,34 +308,59 @@ async function bgIgJsonFetch(url, options = {}) {
 
 async function triggerTabScrollAssist(tabType) {
   const tabId = await findActiveInstagramTabId();
-  if (!tabId) return;
+  if (!tabId) return null;
   try {
-    await new Promise((resolve) => {
-      const t = setTimeout(resolve, 1500);
+    return await new Promise((resolve) => {
+      const t = setTimeout(() => resolve(null), 2000);
       chrome.tabs.sendMessage(
         tabId,
         { action: "EXEC_SWITCH_TAB_AND_SCROLL", tabType, username: jobContext.username },
         (res) => {
           clearTimeout(t);
-          if (res?.meta) {
-            if (res.meta.postsDocId) jobContext.postsDocId = res.meta.postsDocId;
-            if (res.meta.reelsDocId) jobContext.reelsDocId = res.meta.reelsDocId;
-            if (res.meta.lsdToken) jobContext.lsdToken = res.meta.lsdToken;
+          if (res?.meta) syncMetaFromTab(res.meta);
+          if (Array.isArray(res?.domShortcodes)) {
+            for (const item of res.domShortcodes) {
+              if (item?.shortcode) {
+                discoveredDomShortcodes.set(item.shortcode, Boolean(item.isReel));
+              }
+            }
           }
-          resolve();
+          resolve(res);
         }
       );
     });
-  } catch (_) {}
+  } catch (_) {
+    return null;
+  }
 }
 
-async function runAutonomousProfileScan(initPayloads) {
+function buildGraphqlBody(templateStr, fallbackDocId, friendlyName, variablesObj) {
+  const params = new URLSearchParams(templateStr || "");
+  if (jobContext.lsdToken && !params.get("lsd")) {
+    params.set("lsd", jobContext.lsdToken);
+  }
+  params.set("fb_api_req_friendly_name", friendlyName);
+  params.set("variables", JSON.stringify(variablesObj));
+  params.set("server_timestamps", "true");
+  params.set("doc_id", fallbackDocId);
+  return params.toString();
+}
+
+async function runAutonomousProfileScan(initPayloads, initialDomCodes) {
   isJobRunning = true;
   stopRequested = false;
   stats.isRunning = true;
+  latestCapturedPostsCursor = null;
+  latestCapturedReelsCursor = null;
   await ensureOffscreenKeepAlive();
 
   try {
+    if (Array.isArray(initialDomCodes)) {
+      for (const item of initialDomCodes) {
+        if (item?.shortcode) discoveredDomShortcodes.set(item.shortcode, Boolean(item.isReel));
+      }
+    }
+
     for (const item of initPayloads || []) {
       if (stopRequested) break;
       const pUrl = (item?.url || "").toLowerCase();
@@ -369,7 +373,7 @@ async function runAutonomousProfileScan(initPayloads) {
     }
 
     if (!stopRequested) {
-      stats.status = "Background Scanner: Resolving profile info & total counts...";
+      stats.status = "Background Scanner: Locking target User ID & total posts...";
       broadcastStats();
       const profRes = await bgIgJsonFetch(
         `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(jobContext.username)}`
@@ -393,6 +397,21 @@ async function runAutonomousProfileScan(initPayloads) {
       await bgScanAllReels();
     }
 
+    if (!stopRequested && discoveredDomShortcodes.size > 0) {
+      for (const [sc, isReel] of discoveredDomShortcodes.entries()) {
+        if (stopRequested) break;
+        if (seenShortcodesGlobal.has(sc)) continue;
+        const pk = shortcodeToMediaPk(sc);
+        if (pk) {
+          const mRes = await bgIgJsonFetch(`https://www.instagram.com/api/v1/media/${encodeURIComponent(pk)}/info/`);
+          if (mRes.ok && mRes.data) {
+            parseAndQueuePayload(mRes.data, jobContext.username, true, isReel ? "reels" : "posts");
+          }
+          await bgSleep(300);
+        }
+      }
+    }
+
     if (!stopRequested && pendingCarouselPks.size > 0) {
       const pks = Array.from(pendingCarouselPks).filter((pk) => !resolvedCarouselPks.has(pk));
       let idx = 0;
@@ -407,11 +426,11 @@ async function runAutonomousProfileScan(initPayloads) {
         if (mRes.ok && mRes.data) {
           parseAndQueuePayload(mRes.data, jobContext.username, true, "posts");
         }
-        await bgSleep(400);
+        await bgSleep(380);
       }
     }
   } catch (err) {
-    console.error("[InstaSwift v17 Autonomous Error]:", err);
+    console.error("[InstaSwift Autonomous Error]:", err);
   } finally {
     isJobRunning = false;
     stats.isRunning = false;
@@ -422,68 +441,74 @@ async function runAutonomousProfileScan(initPayloads) {
 }
 
 async function bgScanAllGridPosts() {
-  let maxId = null;
-  let page = 0;
-  const visitedRest = new Set();
-
-  while (!stopRequested) {
+  for (const mode of ["byUsername", "byId"]) {
+    if (stopRequested) break;
     if (stats.expectedPosts > 0 && gridPostShortcodes.size >= stats.expectedPosts) return;
-    page++;
-    stats.status = `Bg Scanning 1. Grid Posts (REST Page ${page}: ${gridPostShortcodes.size}/${stats.expectedPosts || "?"})...`;
-    broadcastStats();
+    if (mode === "byId" && !jobContext.userId) continue;
 
-    let url;
-    if (jobContext.userId) {
-      url = new URL(`https://www.instagram.com/api/v1/feed/user/${encodeURIComponent(jobContext.userId)}/`);
-    } else {
-      url = new URL(`https://www.instagram.com/api/v1/feed/user/${encodeURIComponent(jobContext.username)}/username/`);
-    }
-    url.searchParams.set("count", "33");
-    if (maxId) url.searchParams.set("max_id", maxId);
+    let maxId = null;
+    let page = 0;
+    const visitedRest = new Set();
 
-    let res = null;
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      res = await bgIgJsonFetch(url.toString());
-      if (res.ok && res.data) break;
-      if (res.status === 429) {
-        stats.status = `Rate-limit cooldown (5s) on REST Page ${page}...`;
-        broadcastStats();
-        await bgSleep(5000);
-      } else {
-        await bgSleep(700 * attempt);
+    while (!stopRequested) {
+      if (stats.expectedPosts > 0 && gridPostShortcodes.size >= stats.expectedPosts) return;
+      page++;
+      stats.status = `Bg Scanning 1. Grid Posts (REST Page ${page}: ${gridPostShortcodes.size}/${stats.expectedPosts || "?"})...`;
+      broadcastStats();
+
+      const baseUrl =
+        mode === "byUsername"
+          ? `https://www.instagram.com/api/v1/feed/user/${encodeURIComponent(jobContext.username)}/username/`
+          : `https://www.instagram.com/api/v1/feed/user/${encodeURIComponent(jobContext.userId)}/`;
+
+      const url = new URL(baseUrl);
+      url.searchParams.set("count", "33");
+      if (maxId) url.searchParams.set("max_id", maxId);
+
+      let res = null;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        res = await bgIgJsonFetch(url.toString());
+        if (res.ok && res.data) break;
+        if (res.status === 429) {
+          await bgSleep(4500);
+        } else {
+          await bgSleep(600);
+        }
       }
-    }
 
-    if (!res || !res.ok || !res.data) break;
+      if (!res || !res.ok || !res.data) break;
 
-    const data = res.data;
-    if (!jobContext.userId && data.user?.pk) {
-      jobContext.userId = cleanPk(data.user.pk);
-    }
+      const data = res.data;
+      if (data.user?.pk) {
+        jobContext.userId = cleanPk(data.user.pk);
+      }
 
-    parseAndQueuePayload(data, jobContext.username, true, "posts");
+      parseAndQueuePayload(data, jobContext.username, true, "posts");
 
-    const nextCursor = data.next_max_id || data.paging_info?.max_id || null;
-    const moreAvailable = Boolean(data.more_available || data.paging_info?.more_available);
+      const nextCursor = data.next_max_id || data.paging_info?.max_id || null;
+      const moreAvailable = Boolean(data.more_available || data.paging_info?.more_available);
 
-    if (moreAvailable && nextCursor && !visitedRest.has(String(nextCursor))) {
-      visitedRest.add(String(nextCursor));
-      maxId = String(nextCursor);
-      await bgSleep(450);
-    } else {
-      break;
+      if (moreAvailable && nextCursor && !visitedRest.has(String(nextCursor))) {
+        visitedRest.add(String(nextCursor));
+        maxId = String(nextCursor);
+        await bgSleep(420);
+      } else {
+        break;
+      }
     }
   }
 
   if (!stopRequested && (stats.expectedPosts === 0 || gridPostShortcodes.size < stats.expectedPosts)) {
     await triggerTabScrollAssist("posts");
+    await bgSleep(500);
+
     const candidateDocIds = Array.from(new Set([jobContext.postsDocId, ...POSTS_DOC_IDS])).filter(Boolean);
 
     for (const activeDocId of candidateDocIds) {
       if (stopRequested) break;
       if (stats.expectedPosts > 0 && gridPostShortcodes.size >= stats.expectedPosts) return;
 
-      let afterCursor = null;
+      let afterCursor = latestCapturedPostsCursor || null;
       let gqlPage = 0;
       const visitedGql = new Set();
 
@@ -493,9 +518,9 @@ async function bgScanAllGridPosts() {
         stats.status = `Bg Scanning 1. Grid Posts (GraphQL Page ${gqlPage}: ${gridPostShortcodes.size}/${stats.expectedPosts || "?"})...`;
         broadcastStats();
 
-        const variables = {
+        let variables = {
           data: {
-            count: 24,
+            count: 12,
             include_relationship_info: true,
             latest_besties_reel_media: true,
             latest_reel_media: true
@@ -504,27 +529,40 @@ async function bgScanAllGridPosts() {
           __relay_internal__pv__PolarisIsLoggedInrelayprovider: true,
           __relay_internal__pv__PolarisShareSheetV3relayprovider: true
         };
+
+        if (jobContext.postsReqTemplate) {
+          try {
+            const tplParams = new URLSearchParams(jobContext.postsReqTemplate);
+            const tplVars = JSON.parse(tplParams.get("variables") || "{}");
+            variables = { ...tplVars, username: String(jobContext.username) };
+          } catch (_) {}
+        }
+
         if (afterCursor) {
           variables.after = String(afterCursor);
-          variables.first = 24;
+          variables.first = 12;
           variables.last = null;
           variables.before = null;
         }
 
-        const body = new URLSearchParams();
-        if (jobContext.lsdToken) body.set("lsd", jobContext.lsdToken);
-        body.set("fb_api_req_friendly_name", "PolarisProfilePostsTabContentQuery_connection");
-        body.set("variables", JSON.stringify(variables));
-        body.set("server_timestamps", "true");
-        body.set("doc_id", activeDocId);
+        const friendlyName = afterCursor
+          ? "PolarisProfilePostsTabContentQuery_connection"
+          : "PolarisProfilePostsQuery";
+
+        const bodyStr = buildGraphqlBody(
+          jobContext.postsReqTemplate,
+          activeDocId,
+          friendlyName,
+          variables
+        );
 
         const res = await bgIgJsonFetch("https://www.instagram.com/graphql/query", {
           method: "POST",
           headers: {
             "content-type": "application/x-www-form-urlencoded",
-            "x-fb-friendly-name": "PolarisProfilePostsTabContentQuery_connection"
+            "x-fb-friendly-name": friendlyName
           },
-          body: body.toString()
+          body: bodyStr
         });
 
         const conn =
@@ -540,6 +578,7 @@ async function bgScanAllGridPosts() {
         if (hasNext && endCursor && !visitedGql.has(String(endCursor))) {
           visitedGql.add(String(endCursor));
           afterCursor = String(endCursor);
+          latestCapturedPostsCursor = afterCursor;
           await bgSleep(450);
         } else {
           break;
@@ -557,7 +596,7 @@ async function bgScanAllGridPosts() {
       if (stopRequested) break;
       if (stats.expectedPosts > 0 && gridPostShortcodes.size >= stats.expectedPosts) return;
 
-      let endCursor = null;
+      let endCursor = latestCapturedPostsCursor || null;
       let qPage = 0;
       const visitedClassic = new Set();
 
@@ -589,10 +628,74 @@ async function bgScanAllGridPosts() {
         if (hasNext && nextCur && !visitedClassic.has(String(nextCur))) {
           visitedClassic.add(String(nextCur));
           endCursor = String(nextCur);
-          await bgSleep(500);
+          await bgSleep(480);
         } else {
           break;
         }
+      }
+    }
+  }
+
+  if (!stopRequested && stats.expectedPosts > 0 && gridPostShortcodes.size < stats.expectedPosts) {
+    let staleRounds = 0;
+
+    while (!stopRequested && gridPostShortcodes.size < stats.expectedPosts && staleRounds < 14) {
+      const prevCount = gridPostShortcodes.size;
+      stats.status = `Bg Auto-Scrolling Grid (${gridPostShortcodes.size}/${stats.expectedPosts} posts found)...`;
+      broadcastStats();
+
+      await triggerTabScrollAssist("posts");
+      await bgSleep(750);
+
+      if (jobContext.postsReqTemplate && latestCapturedPostsCursor) {
+        let cur = latestCapturedPostsCursor;
+        const seen = new Set();
+        while (!stopRequested && gridPostShortcodes.size < stats.expectedPosts && cur && !seen.has(cur)) {
+          seen.add(cur);
+          let vars = {};
+          try {
+            const p = new URLSearchParams(jobContext.postsReqTemplate);
+            vars = JSON.parse(p.get("variables") || "{}");
+          } catch (_) {}
+          vars.username = String(jobContext.username);
+          vars.after = String(cur);
+          vars.first = 12;
+          vars.last = null;
+          vars.before = null;
+
+          const bStr = buildGraphqlBody(
+            jobContext.postsReqTemplate,
+            jobContext.postsDocId,
+            "PolarisProfilePostsTabContentQuery_connection",
+            vars
+          );
+          const gRes = await bgIgJsonFetch("https://www.instagram.com/graphql/query", {
+            method: "POST",
+            headers: {
+              "content-type": "application/x-www-form-urlencoded",
+              "x-fb-friendly-name": "PolarisProfilePostsTabContentQuery_connection"
+            },
+            body: bStr
+          });
+          const conn = gRes?.data?.data?.xdt_api__v1__feed__user_timeline_graphql_connection;
+          if (!conn) break;
+          parseAndQueuePayload(gRes.data, jobContext.username, true, "posts");
+          if (conn.page_info?.has_next_page && conn.page_info?.end_cursor) {
+            cur = String(conn.page_info.end_cursor);
+            latestCapturedPostsCursor = cur;
+            stats.status = `Bg Fast-Paginating Grid (${gridPostShortcodes.size}/${stats.expectedPosts})...`;
+            broadcastStats();
+            await bgSleep(420);
+          } else {
+            break;
+          }
+        }
+      }
+
+      if (gridPostShortcodes.size > prevCount) {
+        staleRounds = 0;
+      } else {
+        staleRounds++;
       }
     }
   }
@@ -628,7 +731,7 @@ async function bgScanAllReels() {
     if (maxId) body.set("max_id", maxId);
 
     let res = null;
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
       res = await bgIgJsonFetch("https://www.instagram.com/api/v1/clips/user/", {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded" },
@@ -636,11 +739,9 @@ async function bgScanAllReels() {
       });
       if (res.ok && res.data) break;
       if (res.status === 429) {
-        stats.status = `Rate-limit cooldown (5s) on Reels Page ${page}...`;
-        broadcastStats();
-        await bgSleep(5000);
+        await bgSleep(4500);
       } else {
-        await bgSleep(700 * attempt);
+        await bgSleep(600);
       }
     }
 
@@ -656,18 +757,21 @@ async function bgScanAllReels() {
     if (moreAvailable && nextCursor && !visitedReels.has(String(nextCursor))) {
       visitedReels.add(String(nextCursor));
       maxId = String(nextCursor);
-      await bgSleep(450);
+      await bgSleep(420);
     } else {
       break;
     }
   }
 
   if (!stopRequested && jobContext.userId) {
+    await triggerTabScrollAssist("reels");
+    await bgSleep(500);
+
     const candidateReelsDocIds = Array.from(new Set([jobContext.reelsDocId, ...REELS_DOC_IDS])).filter(Boolean);
 
     for (const rDocId of candidateReelsDocIds) {
       if (stopRequested) break;
-      let afterCursor = null;
+      let afterCursor = latestCapturedReelsCursor || null;
       let rPage = 0;
       const visitedGqlReels = new Set();
 
@@ -676,26 +780,43 @@ async function bgScanAllReels() {
         stats.status = `Bg Scanning 2. Reels Section (GraphQL Page ${rPage}: ${uniqueReelShortcodes.size} unique Reels)...`;
         broadcastStats();
 
-        const variables = {
+        let variables = {
           data: {
             include_feed_video: true,
-            page_size: 24,
+            page_size: 12,
             target_user_id: String(jobContext.userId)
           }
         };
+
+        if (jobContext.reelsReqTemplate) {
+          try {
+            const tplParams = new URLSearchParams(jobContext.reelsReqTemplate);
+            const tplVars = JSON.parse(tplParams.get("variables") || "{}");
+            variables = {
+              ...tplVars,
+              data: {
+                ...(tplVars.data || {}),
+                include_feed_video: true,
+                page_size: 12,
+                target_user_id: String(jobContext.userId)
+              }
+            };
+          } catch (_) {}
+        }
+
         if (afterCursor) {
           variables.after = String(afterCursor);
-          variables.first = 24;
+          variables.first = 12;
           variables.last = null;
           variables.before = null;
         }
 
-        const body = new URLSearchParams();
-        if (jobContext.lsdToken) body.set("lsd", jobContext.lsdToken);
-        body.set("fb_api_req_friendly_name", "PolarisProfileReelsTabContentQuery_connection");
-        body.set("variables", JSON.stringify(variables));
-        body.set("server_timestamps", "true");
-        body.set("doc_id", rDocId);
+        const bodyStr = buildGraphqlBody(
+          jobContext.reelsReqTemplate,
+          rDocId,
+          "PolarisProfileReelsTabContentQuery_connection",
+          variables
+        );
 
         const res = await bgIgJsonFetch("https://www.instagram.com/graphql/query", {
           method: "POST",
@@ -703,7 +824,7 @@ async function bgScanAllReels() {
             "content-type": "application/x-www-form-urlencoded",
             "x-fb-friendly-name": "PolarisProfileReelsTabContentQuery_connection"
           },
-          body: body.toString()
+          body: bodyStr
         });
 
         const conn = res?.data?.data?.xdt_api__v1__clips__user__connection_v2;
@@ -717,6 +838,7 @@ async function bgScanAllReels() {
         if (hasNext && endCursor && !visitedGqlReels.has(String(endCursor))) {
           visitedGqlReels.add(String(endCursor));
           afterCursor = String(endCursor);
+          latestCapturedReelsCursor = afterCursor;
           await bgSleep(450);
         } else {
           break;
@@ -743,14 +865,19 @@ function parseAndQueuePayload(rootObj, targetUserLower, isTrustedFeed, sectionCo
     if (node.reels_media || node.tray || node.story_ranking_token) return;
 
     if (node.xdt_api__v1__clips__user__connection_v2) {
-      walk(node.xdt_api__v1__clips__user__connection_v2, "reels");
+      const c = node.xdt_api__v1__clips__user__connection_v2;
+      if (c.page_info?.end_cursor) {
+        latestCapturedReelsCursor = String(c.page_info.end_cursor);
+      }
+      walk(c, "reels");
       return;
     }
     if (node.xdt_api__v1__feed__user_timeline_graphql_connection || node.edge_owner_to_timeline_media) {
-      walk(
-        node.xdt_api__v1__feed__user_timeline_graphql_connection || node.edge_owner_to_timeline_media,
-        "posts"
-      );
+      const c = node.xdt_api__v1__feed__user_timeline_graphql_connection || node.edge_owner_to_timeline_media;
+      if (c.page_info?.end_cursor) {
+        latestCapturedPostsCursor = String(c.page_info.end_cursor);
+      }
+      walk(c, "posts");
       return;
     }
 
@@ -1031,7 +1158,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.action === "OFFSCREEN_HEARTBEAT") {
-    reconcileStuckDownloads();
+    reconcileDownloads();
     if (downloadQueue.length > 0 && activeDownloads < MAX_CONCURRENT_DOWNLOADS) {
       processQueue();
     }
@@ -1065,6 +1192,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     seenAssetIdsGlobal.clear();
     pendingCarouselPks.clear();
     resolvedCarouselPks.clear();
+    discoveredDomShortcodes.clear();
 
     if (message.format) forcedImageFormat = message.format;
 
@@ -1075,12 +1203,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       lsdToken: message.meta?.lsdToken || "",
       wwwClaim: message.meta?.wwwClaim || "0",
       postsDocId: message.meta?.postsDocId || "9310670392322965",
-      reelsDocId: message.meta?.reelsDocId || "7898261790222653"
+      reelsDocId: message.meta?.reelsDocId || "7898261790222653",
+      postsReqTemplate: message.meta?.postsReqTemplate || "",
+      reelsReqTemplate: message.meta?.reelsReqTemplate || ""
     };
 
     stats = {
       username: message.username,
-      status: "Anti-Freeze Background Scanner started...",
+      status: "Background Scanner started...",
       isRunning: true,
       expectedPosts: message.expectedPosts || 0,
       gridPostsMatched: 0,
@@ -1094,17 +1224,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     };
 
     broadcastStats();
-    runAutonomousProfileScan(message.initialPayloads || []);
+    runAutonomousProfileScan(message.initialPayloads || [], message.domShortcodes || []);
     sendResponse({ ok: true });
     return false;
   }
   else if (message.action === "PASSIVE_JSON_CHUNK") {
-    if (message.meta) {
-      if (message.meta.postsDocId) jobContext.postsDocId = message.meta.postsDocId;
-      if (message.meta.reelsDocId) jobContext.reelsDocId = message.meta.reelsDocId;
-      if (message.meta.lsdToken) jobContext.lsdToken = message.meta.lsdToken;
-      if (message.meta.wwwClaim && message.meta.wwwClaim !== "0") jobContext.wwwClaim = message.meta.wwwClaim;
-    }
+    if (message.meta) syncMetaFromTab(message.meta);
     if (isJobRunning && jobContext.username && message.payload) {
       const sec = (message.url || "").includes("clips") ? "reels" : "posts";
       parseAndQueuePayload(message.payload, jobContext.username, true, sec, false);
@@ -1161,16 +1286,27 @@ function processQueue() {
   }
 }
 
+// FIXED: Passes strict sanitized relative path + `saveAs: false` + `conflictAction: "uniquify"` directly (NO `onDeterminingFilename` race condition!)
 function startDownload(item) {
-  const cleanUser = item.username.replace(/[^a-zA-Z0-9._-]/g, "_");
-  const filePath = `Instagram/${cleanUser}/${item.filename}`;
+  const cleanUser = String(item.username || "instagram").replace(/[^a-zA-Z0-9._-]/g, "_");
+  const baseName = String(item.baseFilename || item.filename || `media_${Date.now()}`)
+    .replace(/\.[^.]+$/, "")
+    .replace(/[^a-zA-Z0-9._-]/g, "_");
+
+  let finalExt = item.extHint || "jpg";
+  if (finalExt !== "mp4") {
+    if (forcedImageFormat === "png") finalExt = "png";
+    else if (forcedImageFormat === "jpg") finalExt = "jpg";
+  }
+
+  const safeFilePath = `Instagram/${cleanUser}/${baseName}.${finalExt}`;
 
   try {
     chrome.downloads.download(
       {
         url: item.url,
-        filename: filePath,
-        conflictAction: "overwrite",
+        filename: safeFilePath,
+        conflictAction: "uniquify",
         saveAs: false
       },
       (downloadId) => {
@@ -1223,7 +1359,7 @@ function updateStatusText() {
     stats.status = `✅ Completed! Saved ${stats.savedToDisk} / ${stats.totalQueued} unique files to PC.`;
     closeOffscreenKeepAlive();
   } else if (!isJobRunning) {
-    stats.status = `Saving to PC (Minimized/Background): ${stats.savedToDisk} / ${stats.totalQueued} (${remaining} remaining)...`;
+    stats.status = `Saving to PC (Background): ${stats.savedToDisk} / ${stats.totalQueued} (${remaining} remaining)...`;
   }
 }
 

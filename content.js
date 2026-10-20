@@ -4,10 +4,11 @@ let latestSessionMeta = {
   lsdToken: "",
   wwwClaim: "0",
   postsDocId: "9310670392322965",
-  reelsDocId: "7898261790222653"
+  reelsDocId: "7898261790222653",
+  postsReqTemplate: "",
+  reelsReqTemplate: ""
 };
 
-// Keep Instagram Content Tab Awake via Web Lock + Silent Tab Audio Context when job runs
 let tabAudioCtx = null;
 function activateTabWakeLock() {
   try {
@@ -115,7 +116,7 @@ window.addEventListener("message", (event) => {
       url: event.data.url || "",
       payload
     });
-    if (rawInterceptBuffer.length > 400) rawInterceptBuffer.shift();
+    if (rawInterceptBuffer.length > 500) rawInterceptBuffer.shift();
     indexPassiveMediaAndStories(payload);
 
     safeSendMessage({
@@ -173,14 +174,14 @@ function parseExpectedPostsFromHeaderDOM() {
   return 0;
 }
 
-function findUserIdInDOM(usernameLower) {
+function findTargetUserIdInDOM(usernameLower) {
   const html = document.documentElement.innerHTML;
   const escaped = usernameLower.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const regexes = [
-    new RegExp(`"id":"(\\d+)"[^}]{0,250}"username":"${escaped}"`, "i"),
-    new RegExp(`"username":"${escaped}"[^}]{0,250}"id":"(\\d+)"`, "i"),
-    new RegExp(`"pk":"(\\d+)"[^}]{0,250}"username":"${escaped}"`, "i"),
-    /"user_id":"(\d+)"/,
+    new RegExp(`"id":"(\\d+)"[^}]{0,220}"username":"${escaped}"`, "i"),
+    new RegExp(`"username":"${escaped}"[^}]{0,220}"id":"(\\d+)"`, "i"),
+    new RegExp(`"pk":"(\\d+)"[^}]{0,220}"username":"${escaped}"`, "i"),
+    new RegExp(`"username":"${escaped}"[^}]{0,220}"pk":"(\\d+)"`, "i"),
     /"profilePage_(\d+)"/,
     /"target_id":"(\d+)"/
   ];
@@ -218,9 +219,19 @@ function collectEmbeddedPageJsonPayloads(usernameLower) {
   return list;
 }
 
-// =========================================================
-// 1. PROFILE BUTTON & FORMAT SELECTOR
-// =========================================================
+function scrapeVisibleDomShortcodes() {
+  const codes = [];
+  const anchors = document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]');
+  for (const a of anchors) {
+    const href = a.getAttribute("href") || "";
+    const m = href.match(/\/(p|reel)\/([A-Za-z0-9_-]+)/);
+    if (m) {
+      codes.push({ shortcode: m[2], isReel: m[1] === "reel" });
+    }
+  }
+  return codes;
+}
+
 function injectProfileButton() {
   const username = getUsernameFromUrl();
   if (!username) return;
@@ -280,14 +291,14 @@ async function triggerBackgroundAutonomousJob(username) {
   createOrShowHUD(username);
 
   if (currentSubTab !== "posts") {
-    updateHUDStatus(`🔄 Switching from /${currentSubTab}/ to Main Grid & starting Anti-Freeze Scan...`);
+    updateHUDStatus(`🔄 Switching from /${currentSubTab}/ to Main Grid & starting full scan...`);
     const mainGridTabLink = document.querySelector(`a[href="/${username}/"], a[href="/${userLower}/"]`);
     if (mainGridTabLink) {
       mainGridTabLink.click();
       await new Promise((r) => setTimeout(r, 900));
     }
   } else {
-    updateHUDStatus("🚀 Anti-Freeze Engine Active! Minimize Chrome to VS Code or switch tabs freely.");
+    updateHUDStatus("🚀 InstaSwift Active! Scanning all Grid Posts & Reels in Background...");
   }
 
   const metaRes = await callMainWorld("GET_SESSION_META", {}, 3000);
@@ -295,7 +306,7 @@ async function triggerBackgroundAutonomousJob(username) {
     latestSessionMeta = { ...latestSessionMeta, ...metaRes.meta };
   }
 
-  const userId = findUserIdInDOM(userLower);
+  const userId = findTargetUserIdInDOM(userLower);
   const expectedPosts = parseExpectedPostsFromHeaderDOM();
   const embeddedPayloads = collectEmbeddedPageJsonPayloads(userLower);
 
@@ -306,13 +317,11 @@ async function triggerBackgroundAutonomousJob(username) {
     expectedPosts,
     format: preferredImageFormat,
     meta: latestSessionMeta,
-    initialPayloads: [...embeddedPayloads, ...rawInterceptBuffer]
+    initialPayloads: [...embeddedPayloads, ...rawInterceptBuffer],
+    domShortcodes: scrapeVisibleDomShortcodes()
   });
 }
 
-// =========================================================
-// 2. SINGLE POST DOWNLOAD BUTTONS (GRID HOVER + MODAL)
-// =========================================================
 function injectGridPostDownloadButtons() {
   const anchors = document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]');
   for (const a of anchors) {
@@ -405,9 +414,6 @@ async function downloadSinglePostComplete(shortcode, isReel, btnEl) {
   }
 }
 
-// =========================================================
-// 3. ACCURATE HD STORY & HIGHLIGHTS DOWNLOADER
-// =========================================================
 function injectManualStoryButtons() {
   if (!window.location.pathname.startsWith("/stories/")) {
     const existingBar = document.getElementById("instaswift-story-bar");
@@ -462,7 +468,7 @@ async function downloadManualStories(downloadAllInReel = false) {
     const res = await callMainWorld("FETCH_STORIES_REEL", { reelId: `highlight:${urlStoryOrHighlightId}` }, 8500);
     if (res?.ok && res.data) indexPassiveMediaAndStories(res.data, targetSlug);
   } else if (!isHighlight && targetSlug) {
-    let uid = findUserIdInDOM(targetSlug);
+    let uid = findTargetUserIdInDOM(targetSlug);
     if (!uid) {
       const profRes = await callMainWorld("FETCH_WEB_PROFILE_INFO", { username: targetSlug }, 7000);
       const u = profRes?.data?.data?.user || profRes?.data?.graphql?.user || profRes?.data?.user;
@@ -594,9 +600,6 @@ function extractValidStoryCanvasMediaFromDOM(targetSlug, fallbackId) {
   return null;
 }
 
-// =========================================================
-// PASSIVE MEDIA & STORY TRAY INDEXER
-// =========================================================
 function indexPassiveMediaAndStories(rootObj, fallbackUsername = "") {
   const visited = new WeakSet();
 
@@ -711,9 +714,6 @@ function recordStoryNode(node, ownerUser) {
   storyTraysByUser.get(sUser).set(pk, storyItem);
 }
 
-// =========================================================
-// 4. CLEAN 2-BOX HUD (LIVE UPDATES FROM AUTONOMOUS BACKGROUND ENGINE)
-// =========================================================
 function createOrShowHUD(username) {
   let hud = document.getElementById("instaswift-hud");
   if (!hud) {
@@ -721,7 +721,7 @@ function createOrShowHUD(username) {
     hud.id = "instaswift-hud";
     hud.innerHTML = `
       <div class="is-hud-header">
-        <span class="is-hud-title">⚡ InstaSwift v17 — <strong id="is-hud-user">@${username}</strong></span>
+        <span class="is-hud-title">⚡ InstaSwift — <strong id="is-hud-user">@${username}</strong></span>
         <button id="is-hud-close" title="Close">✕</button>
       </div>
       <div class="is-hud-status" id="is-hud-status">Ready</div>
@@ -735,7 +735,7 @@ function createOrShowHUD(username) {
           <span class="is-stat-lbl">2. Reels Section (Unique)</span>
         </div>
       </div>
-      <div class="is-hud-sub" id="is-hud-sub">PC Disk Saved: 0 / 0 files (Anti-Freeze Active!)</div>
+      <div class="is-hud-sub" id="is-hud-sub">PC Disk Saved: 0 / 0 files</div>
       <div class="is-hud-actions">
         <button id="is-hud-stop" class="is-stop-btn">Stop</button>
       </div>
@@ -786,7 +786,7 @@ function renderStatsToHUD(stats) {
   if (btn) {
     if (stats.isRunning) {
       btn.disabled = true;
-      btn.textContent = "⚡ Running (Anti-Freeze Active)...";
+      btn.textContent = "⚡ Running in Background...";
     } else {
       btn.disabled = false;
       btn.textContent = "⚡ Download All (Works Minimized / Background)";
@@ -794,9 +794,6 @@ function renderStatsToHUD(stats) {
   }
 }
 
-// =========================================================
-// 5. BACKGROUND RPC BRIDGE + TAB NAVIGATION & SCROLL ASSIST
-// =========================================================
 try {
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.action === "STATS_UPDATE" && msg.stats) {
@@ -819,7 +816,10 @@ try {
     else if (msg.action === "EXEC_MAIN_WORLD_FETCH") {
       activateTabWakeLock();
       callMainWorld("MAIN_WORLD_FETCH", { url: msg.url, options: msg.options || {} }, msg.timeoutMs || 15000)
-        .then((res) => sendResponse(res))
+        .then((res) => {
+          if (res?.meta) latestSessionMeta = { ...latestSessionMeta, ...res.meta };
+          sendResponse(res);
+        })
         .catch(() => sendResponse({ ok: false, status: 0, data: null }));
       return true;
     }
@@ -828,17 +828,42 @@ try {
       (async () => {
         try {
           const targetTab = msg.tabType || "posts";
-          const user = msg.username || getUsernameFromUrl() || "";
-          if (targetTab === "posts") {
-            const link = document.querySelector(`a[href="/${user}/"]`);
-            if (link && window.location.pathname.includes("/reels")) link.click();
-          } else if (targetTab === "reels") {
-            const link = document.querySelector(`a[href="/${user}/reels/"]`);
-            if (link && !window.location.pathname.includes("/reels")) link.click();
+          const user = (msg.username || getUsernameFromUrl() || "").toLowerCase();
+
+          const allTabLinks = Array.from(document.querySelectorAll('a[role="tab"], header ~ div a, main a'));
+          if (targetTab === "posts" && window.location.pathname.includes("/reels")) {
+            const postTab = allTabLinks.find((a) => {
+              const h = (a.getAttribute("href") || "").toLowerCase();
+              return h === `/${user}/` || h === `/${user}`;
+            });
+            if (postTab) postTab.click();
+          } else if (targetTab === "reels" && !window.location.pathname.includes("/reels")) {
+            const reelTab = allTabLinks.find((a) => {
+              const h = (a.getAttribute("href") || "").toLowerCase();
+              return h.includes(`/${user}/reels`);
+            });
+            if (reelTab) reelTab.click();
           }
-          window.scrollTo(0, document.body.scrollHeight);
-          await new Promise((r) => setTimeout(r, 350));
-          sendResponse({ ok: true, meta: latestSessionMeta });
+
+          const gridLinks = Array.from(document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]'));
+          if (gridLinks.length > 0) {
+            const lastEl = gridLinks[gridLinks.length - 1];
+            lastEl.scrollIntoView({ behavior: "instant", block: "end" });
+          }
+          window.scrollBy(0, 2400);
+          window.dispatchEvent(new Event("scroll", { bubbles: true }));
+
+          await new Promise((r) => setTimeout(r, 450));
+          const mRes = await callMainWorld("GET_SESSION_META", {}, 2000);
+          if (mRes?.ok && mRes.meta) {
+            latestSessionMeta = { ...latestSessionMeta, ...mRes.meta };
+          }
+          sendResponse({
+            ok: true,
+            meta: latestSessionMeta,
+            domShortcodes: scrapeVisibleDomShortcodes(),
+            scrollHeight: document.body.scrollHeight
+          });
         } catch (_) {
           sendResponse({ ok: false });
         }
