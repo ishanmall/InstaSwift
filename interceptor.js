@@ -1,6 +1,6 @@
 (function () {
-  if (window.__instaswiftLoaded) return;
-  window.__instaswiftLoaded = true;
+  if (window.__instaswiftV18Loaded) return;
+  window.__instaswiftV18Loaded = true;
 
   const IG_APP_ID = "936619743392459";
 
@@ -45,6 +45,31 @@
 
   function emitToContent(type, data) {
     window.postMessage({ source: "INSTASWIFT_MAIN", type, ...data }, "*");
+  }
+
+  // Safely checks if a URL is same-origin (www.instagram.com) so CORS header warnings never trigger
+  function isSameOriginIgUrl(rawUrl) {
+    if (!rawUrl || typeof rawUrl !== "string") return false;
+    if (rawUrl.startsWith("/") && !rawUrl.startsWith("//")) return true;
+    try {
+      const u = new URL(rawUrl, window.location.origin);
+      return u.origin === window.location.origin;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // Extracts x-ig-set-www-claim from getAllResponseHeaders() without calling getResponseHeader() on restricted headers
+  function extractSafeClaimFromXhr(xhr, reqUrl) {
+    try {
+      if (!isSameOriginIgUrl(reqUrl)) return null;
+      const allHeaders = xhr.getAllResponseHeaders?.() || "";
+      if (!allHeaders.toLowerCase().includes("x-ig-set-www-claim")) return null;
+      const m = allHeaders.match(/x-ig-set-www-claim:\s*([^\r\n]+)/i);
+      return m && m[1] ? m[1].trim() : null;
+    } catch (_) {
+      return null;
+    }
   }
 
   function shortcodeToMediaPk(shortcode) {
@@ -99,8 +124,8 @@
 
   const origFetch = window.fetch;
   window.fetch = async function (...args) {
+    const reqUrl = typeof args[0] === "string" ? args[0] : (args[0]?.url || "");
     try {
-      const reqUrl = typeof args[0] === "string" ? args[0] : (args[0]?.url || "");
       const reqBody = args[1]?.body;
       if (typeof reqBody === "string") {
         inspectRequestForGraphqlMeta(reqUrl, reqBody);
@@ -109,12 +134,13 @@
 
     const response = await origFetch.apply(this, args);
     try {
-      const claim = response.headers?.get?.("x-ig-set-www-claim");
-      if (claim) {
-        capturedMeta.wwwClaim = claim;
-        try { sessionStorage.setItem("www-claim-v2", claim); } catch (_) {}
+      if (isSameOriginIgUrl(reqUrl)) {
+        const claim = response.headers?.get?.("x-ig-set-www-claim");
+        if (claim) {
+          capturedMeta.wwwClaim = claim;
+          try { sessionStorage.setItem("www-claim-v2", claim); } catch (_) {}
+        }
       }
-      const reqUrl = typeof args[0] === "string" ? args[0] : (args[0]?.url || "");
       if (
         reqUrl.includes("/graphql") ||
         reqUrl.includes("/api/v1/") ||
@@ -155,12 +181,14 @@
 
     this.addEventListener("load", function () {
       try {
-        const claim = this.getResponseHeader?.("x-ig-set-www-claim");
+        const url = this.__isUrl || "";
+        // FIXED: Never call this.getResponseHeader("x-ig-set-www-claim") directly!
+        const claim = extractSafeClaimFromXhr(this, url);
         if (claim) {
           capturedMeta.wwwClaim = claim;
           try { sessionStorage.setItem("www-claim-v2", claim); } catch (_) {}
         }
-        const url = this.__isUrl || "";
+
         if (url.includes("/graphql") || url.includes("/api/v1/") || url.includes("query")) {
           const t = (this.responseText || "").trim();
           if (t.startsWith("{") || t.startsWith("[")) {
@@ -201,10 +229,12 @@
       if (options.body) fetchOpts.body = options.body;
 
       const res = await origFetch(url, fetchOpts);
-      const newClaim = res.headers?.get?.("x-ig-set-www-claim");
-      if (newClaim) {
-        capturedMeta.wwwClaim = newClaim;
-        try { sessionStorage.setItem("www-claim-v2", newClaim); } catch (_) {}
+      if (isSameOriginIgUrl(url)) {
+        const newClaim = res.headers?.get?.("x-ig-set-www-claim");
+        if (newClaim) {
+          capturedMeta.wwwClaim = newClaim;
+          try { sessionStorage.setItem("www-claim-v2", newClaim); } catch (_) {}
+        }
       }
 
       if (!res.ok) return { ok: false, status: res.status, data: null };
