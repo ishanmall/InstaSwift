@@ -1,17 +1,24 @@
 (function () {
-  if (window.__instaswiftV18Loaded) return;
-  window.__instaswiftV18Loaded = true;
+  if (window.__instaswiftV28Loaded) return;
+  window.__instaswiftV28Loaded = true;
+
+  try {
+    Object.defineProperty(document, "hidden", { get: () => false, configurable: true });
+    Object.defineProperty(document, "visibilityState", { get: () => "visible", configurable: true });
+    Object.defineProperty(document, "webkitHidden", { get: () => false, configurable: true });
+    document.hasFocus = () => true;
+    window.addEventListener("visibilitychange", (e) => e.stopImmediatePropagation(), true);
+    window.addEventListener("blur", (e) => e.stopImmediatePropagation(), true);
+  } catch (_) {}
 
   const IG_APP_ID = "936619743392459";
 
-  const capturedMeta = {
+  const capturedGraphql = {
     postsDocId: "9310670392322965",
     reelsDocId: "7898261790222653",
     lsdToken: "",
-    wwwClaim: "0",
-    asbdId: "129477",
-    postsReqTemplate: "",
-    reelsReqTemplate: ""
+    postsTemplate: "",
+    reelsTemplate: ""
   };
 
   function getCsrfToken() {
@@ -20,56 +27,14 @@
   }
 
   function getLsdToken() {
-    if (capturedMeta.lsdToken) return capturedMeta.lsdToken;
+    if (capturedGraphql.lsdToken) return capturedGraphql.lsdToken;
     const html = document.documentElement?.innerHTML || "";
     const m =
       html.match(/["LSD",[],\{"token":"([^"]+)"\}/) ||
       html.match(/"lsd":"([^"]+)"/) ||
       html.match(/name="lsd"\s+value="([^"]+)"/);
-    if (m && m[1]) capturedMeta.lsdToken = m[1];
-    return capturedMeta.lsdToken;
-  }
-
-  function getSessionMeta() {
-    return {
-      csrfToken: getCsrfToken(),
-      lsdToken: getLsdToken(),
-      wwwClaim: sessionStorage.getItem("www-claim-v2") || capturedMeta.wwwClaim || "0",
-      postsDocId: capturedMeta.postsDocId,
-      reelsDocId: capturedMeta.reelsDocId,
-      asbdId: capturedMeta.asbdId,
-      postsReqTemplate: capturedMeta.postsReqTemplate,
-      reelsReqTemplate: capturedMeta.reelsReqTemplate
-    };
-  }
-
-  function emitToContent(type, data) {
-    window.postMessage({ source: "INSTASWIFT_MAIN", type, ...data }, "*");
-  }
-
-  // Safely checks if a URL is same-origin (www.instagram.com) so CORS header warnings never trigger
-  function isSameOriginIgUrl(rawUrl) {
-    if (!rawUrl || typeof rawUrl !== "string") return false;
-    if (rawUrl.startsWith("/") && !rawUrl.startsWith("//")) return true;
-    try {
-      const u = new URL(rawUrl, window.location.origin);
-      return u.origin === window.location.origin;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  // Extracts x-ig-set-www-claim from getAllResponseHeaders() without calling getResponseHeader() on restricted headers
-  function extractSafeClaimFromXhr(xhr, reqUrl) {
-    try {
-      if (!isSameOriginIgUrl(reqUrl)) return null;
-      const allHeaders = xhr.getAllResponseHeaders?.() || "";
-      if (!allHeaders.toLowerCase().includes("x-ig-set-www-claim")) return null;
-      const m = allHeaders.match(/x-ig-set-www-claim:\s*([^\r\n]+)/i);
-      return m && m[1] ? m[1].trim() : null;
-    } catch (_) {
-      return null;
-    }
+    if (m && m[1]) capturedGraphql.lsdToken = m[1];
+    return capturedGraphql.lsdToken;
   }
 
   function shortcodeToMediaPk(shortcode) {
@@ -88,64 +53,50 @@
     }
   }
 
-  function inspectRequestForGraphqlMeta(url, bodyStr) {
+  function emitToContent(type, data) {
+    window.postMessage(
+      {
+        source: "INSTASWIFT_MAIN",
+        type,
+        pagePath: window.location.pathname,
+        ...data
+      },
+      "*"
+    );
+  }
+
+  function inspectOutgoingGraphql(bodyStr) {
     try {
-      if (typeof bodyStr === "string" && bodyStr.includes("doc_id=")) {
-        const params = new URLSearchParams(bodyStr);
-        const friendly = params.get("fb_api_req_friendly_name") || "";
-        const docId = params.get("doc_id") || "";
-        const lsd = params.get("lsd") || "";
-        const variables = params.get("variables") || "";
-
-        if (lsd) capturedMeta.lsdToken = lsd;
-
-        if (docId) {
-          if (
-            friendly.includes("PostsTab") ||
-            friendly.includes("Timeline") ||
-            friendly.includes("ProfilePosts") ||
-            (variables.includes('"username"') && variables.includes('"count"'))
-          ) {
-            capturedMeta.postsDocId = docId;
-            capturedMeta.postsReqTemplate = bodyStr;
-          } else if (
-            friendly.includes("ReelsTab") ||
-            friendly.includes("Clips") ||
-            (variables.includes("target_user_id") && variables.includes("page_size"))
-          ) {
-            capturedMeta.reelsDocId = docId;
-            capturedMeta.reelsReqTemplate = bodyStr;
-          }
+      if (typeof bodyStr !== "string" || !bodyStr.includes("doc_id=")) return;
+      const params = new URLSearchParams(bodyStr);
+      const friendly = params.get("fb_api_req_friendly_name") || "";
+      const docId = params.get("doc_id") || "";
+      const lsd = params.get("lsd") || "";
+      const vars = params.get("variables") || "";
+      if (lsd) capturedGraphql.lsdToken = lsd;
+      if (docId) {
+        if (friendly.includes("Posts") || friendly.includes("Timeline") || vars.includes('"username"')) {
+          capturedGraphql.postsDocId = docId;
+          capturedGraphql.postsTemplate = bodyStr;
+        } else if (friendly.includes("Reels") || friendly.includes("Clips") || vars.includes("target_user_id")) {
+          capturedGraphql.reelsDocId = docId;
+          capturedGraphql.reelsTemplate = bodyStr;
         }
-        emitToContent("META_UPDATE", { meta: getSessionMeta() });
       }
     } catch (_) {}
   }
 
   const origFetch = window.fetch;
   window.fetch = async function (...args) {
-    const reqUrl = typeof args[0] === "string" ? args[0] : (args[0]?.url || "");
+    const pagePathAtStart = window.location.pathname;
     try {
-      const reqBody = args[1]?.body;
-      if (typeof reqBody === "string") {
-        inspectRequestForGraphqlMeta(reqUrl, reqBody);
-      }
+      if (typeof args[1]?.body === "string") inspectOutgoingGraphql(args[1].body);
     } catch (_) {}
 
     const response = await origFetch.apply(this, args);
     try {
-      if (isSameOriginIgUrl(reqUrl)) {
-        const claim = response.headers?.get?.("x-ig-set-www-claim");
-        if (claim) {
-          capturedMeta.wwwClaim = claim;
-          try { sessionStorage.setItem("www-claim-v2", claim); } catch (_) {}
-        }
-      }
-      if (
-        reqUrl.includes("/graphql") ||
-        reqUrl.includes("/api/v1/") ||
-        reqUrl.includes("query")
-      ) {
+      const reqUrl = typeof args[0] === "string" ? args[0] : (args[0]?.url || "");
+      if (reqUrl.includes("/graphql") || reqUrl.includes("/api/v1/") || reqUrl.includes("query")) {
         const clone = response.clone();
         clone.text().then((txt) => {
           const t = txt.trim();
@@ -153,8 +104,8 @@
             try {
               emitToContent("INTERCEPTED_JSON", {
                 url: reqUrl,
-                payload: JSON.parse(t),
-                meta: getSessionMeta()
+                pagePath: pagePathAtStart,
+                payload: JSON.parse(t)
               });
             } catch (_) {}
           }
@@ -169,33 +120,25 @@
 
   XMLHttpRequest.prototype.open = function (method, url, ...rest) {
     this.__isUrl = typeof url === "string" ? url : String(url || "");
+    this.__pagePath = window.location.pathname;
     return origOpen.call(this, method, url, ...rest);
   };
 
   XMLHttpRequest.prototype.send = function (...args) {
     try {
-      if (typeof args[0] === "string") {
-        inspectRequestForGraphqlMeta(this.__isUrl || "", args[0]);
-      }
+      if (typeof args[0] === "string") inspectOutgoingGraphql(args[0]);
     } catch (_) {}
 
     this.addEventListener("load", function () {
       try {
         const url = this.__isUrl || "";
-        // FIXED: Never call this.getResponseHeader("x-ig-set-www-claim") directly!
-        const claim = extractSafeClaimFromXhr(this, url);
-        if (claim) {
-          capturedMeta.wwwClaim = claim;
-          try { sessionStorage.setItem("www-claim-v2", claim); } catch (_) {}
-        }
-
         if (url.includes("/graphql") || url.includes("/api/v1/") || url.includes("query")) {
           const t = (this.responseText || "").trim();
           if (t.startsWith("{") || t.startsWith("[")) {
             emitToContent("INTERCEPTED_JSON", {
               url,
-              payload: JSON.parse(t),
-              meta: getSessionMeta()
+              pagePath: this.__pagePath || window.location.pathname,
+              payload: JSON.parse(t)
             });
           }
         }
@@ -207,44 +150,30 @@
   async function mainWorldJsonFetch(url, options = {}) {
     try {
       const lsd = getLsdToken();
-      const csrf = getCsrfToken();
-      const claim = sessionStorage.getItem("www-claim-v2") || capturedMeta.wwwClaim || "0";
-
       const headers = {
         "x-ig-app-id": IG_APP_ID,
-        "x-csrftoken": csrf,
+        "x-csrftoken": getCsrfToken(),
         "x-requested-with": "XMLHttpRequest",
-        "x-asbd-id": capturedMeta.asbdId || "129477",
-        "x-ig-www-claim": claim,
+        "x-asbd-id": "129477",
+        "x-ig-www-claim": sessionStorage.getItem("www-claim-v2") || "0",
         "accept": "*/*",
         ...(options.headers || {})
       };
       if (lsd) headers["x-fb-lsd"] = lsd;
 
-      const fetchOpts = {
-        method: options.method || "GET",
+      const res = await origFetch(url, {
+        ...options,
         headers,
         credentials: "include"
-      };
-      if (options.body) fetchOpts.body = options.body;
-
-      const res = await origFetch(url, fetchOpts);
-      if (isSameOriginIgUrl(url)) {
-        const newClaim = res.headers?.get?.("x-ig-set-www-claim");
-        if (newClaim) {
-          capturedMeta.wwwClaim = newClaim;
-          try { sessionStorage.setItem("www-claim-v2", newClaim); } catch (_) {}
-        }
-      }
-
+      });
       if (!res.ok) return { ok: false, status: res.status, data: null };
       const txt = (await res.text()).trim();
       if (!txt.startsWith("{") && !txt.startsWith("[")) {
-        return { ok: false, status: res.status, data: null };
+        return { ok: false, status: 200, data: null };
       }
-      return { ok: true, status: res.status, data: JSON.parse(txt), meta: getSessionMeta() };
-    } catch (err) {
-      return { ok: false, status: 0, error: String(err), data: null };
+      return { ok: true, status: 200, data: JSON.parse(txt) };
+    } catch (_) {
+      return { ok: false, status: 0, data: null };
     }
   }
 
@@ -252,18 +181,71 @@
     if (event.source !== window || event.data?.source !== "INSTASWIFT_CONTENT") return;
     const { cmd, reqId, payload } = event.data;
 
-    if (cmd === "GET_SESSION_META") {
-      emitToContent("CMD_RESPONSE", { reqId, result: { ok: true, meta: getSessionMeta() } });
-    }
-    else if (cmd === "MAIN_WORLD_FETCH") {
-      const { url, options } = payload;
-      const result = await mainWorldJsonFetch(url, options || {});
+    if (cmd === "FETCH_WEB_PROFILE_INFO") {
+      const { username } = payload;
+      const result = await mainWorldJsonFetch(
+        `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`
+      );
       emitToContent("CMD_RESPONSE", { reqId, result });
     }
-    else if (cmd === "FETCH_WEB_PROFILE_INFO") {
-      const { username } = payload;
-      const url = `https://www.instagram.com/api/v1/users/web_profile_info/?username=${encodeURIComponent(username)}`;
-      const result = await mainWorldJsonFetch(url);
+    else if (cmd === "FETCH_POSTS_PAGE") {
+      const { username, userId, maxId } = payload;
+      const baseUrl = (userId && maxId)
+        ? `https://www.instagram.com/api/v1/feed/user/${encodeURIComponent(userId)}/`
+        : `https://www.instagram.com/api/v1/feed/user/${encodeURIComponent(username)}/username/`;
+
+      const url = new URL(baseUrl);
+      url.searchParams.set("count", "33");
+      if (maxId) url.searchParams.set("max_id", maxId);
+
+      const result = await mainWorldJsonFetch(url.toString());
+      emitToContent("CMD_RESPONSE", { reqId, result });
+    }
+    else if (cmd === "FETCH_REELS_PAGE") {
+      const { userId, maxId } = payload;
+      const body = new URLSearchParams({
+        target_user_id: String(userId),
+        page_size: "24",
+        include_feed_video: "true"
+      });
+      if (maxId) body.set("max_id", maxId);
+
+      const result = await mainWorldJsonFetch("https://www.instagram.com/api/v1/clips/user/", {
+        method: "POST",
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        body: body.toString()
+      });
+      emitToContent("CMD_RESPONSE", { reqId, result });
+    }
+    else if (cmd === "FETCH_REELS_GRAPHQL") {
+      const { userId, afterCursor } = payload;
+      const variables = {
+        data: {
+          include_feed_video: true,
+          page_size: 24,
+          target_user_id: String(userId)
+        }
+      };
+      if (afterCursor) {
+        variables.after = String(afterCursor);
+        variables.first = 24;
+      }
+      const params = new URLSearchParams(capturedGraphql.reelsTemplate || "");
+      const lsd = getLsdToken();
+      if (lsd) params.set("lsd", lsd);
+      params.set("fb_api_req_friendly_name", "PolarisProfileReelsTabContentQuery_connection");
+      params.set("variables", JSON.stringify(variables));
+      params.set("server_timestamps", "true");
+      params.set("doc_id", capturedGraphql.reelsDocId || "7898261790222653");
+
+      const result = await mainWorldJsonFetch("https://www.instagram.com/graphql/query", {
+        method: "POST",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          "x-fb-friendly-name": "PolarisProfileReelsTabContentQuery_connection"
+        },
+        body: params.toString()
+      });
       emitToContent("CMD_RESPONSE", { reqId, result });
     }
     else if (cmd === "FETCH_MEDIA_INFO") {

@@ -1,14 +1,14 @@
 if (navigator.locks && navigator.locks.request) {
-  navigator.locks.request("instaswift_os_wakelock", () => new Promise(() => {}));
+  navigator.locks.request("instaswift_v28_bg_lock", () => new Promise(() => {}));
 }
 
 let audioCtx = null;
-function startSilentAudioWakeLock() {
+function ensureAudioWakeLock() {
   try {
     if (audioCtx && audioCtx.state === "running") return;
-    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-    if (!AudioContextClass) return;
-    audioCtx = new AudioContextClass();
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    audioCtx = new Ctx();
     const osc = audioCtx.createOscillator();
     const gain = audioCtx.createGain();
     gain.gain.value = 0.00001;
@@ -18,7 +18,7 @@ function startSilentAudioWakeLock() {
     osc.start();
   } catch (_) {}
 }
-startSilentAudioWakeLock();
+ensureAudioWakeLock();
 
 let port = null;
 function connectPort() {
@@ -33,15 +33,11 @@ function connectPort() {
 connectPort();
 
 setInterval(() => {
-  startSilentAudioWakeLock();
+  ensureAudioWakeLock();
   try {
-    if (port) {
-      port.postMessage({ type: "HEARTBEAT", ts: Date.now() });
-    } else {
-      connectPort();
-    }
-    chrome.runtime.sendMessage({ action: "OFFSCREEN_HEARTBEAT" }).catch(() => {});
+    if (port) port.postMessage({ type: "HEARTBEAT", ts: Date.now() });
+    else connectPort();
   } catch (_) {
     connectPort();
   }
-}, 500);
+}, 400);
