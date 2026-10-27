@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "InstaSwift v28.0 — Final 3-Room & HD Story Downloader",
-  "version": "28.0.0",
+  "name": "InstaSwift v29.0 — 3-Room Bulk + Single Video & Story Downloader",
+  "version": "29.0.0",
   "minimum_chrome_version": "109",
-  "description": "One-pass Grid & Reels 3-Room Scanner + HD Story Video/Photo Downloader + 10x Bulk Downloader.",
+  "description": "One-pass Grid & Reels 3-Room Scanner + Particular Single Video/Reel/Post Downloader + HD Story Downloader.",
   "permissions": [
     "downloads",
     "activeTab",
@@ -35,6 +35,6 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "InstaSwift v28.0"
+    "default_title": "InstaSwift v29.0"
   }
 }

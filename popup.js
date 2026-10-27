@@ -12,6 +12,16 @@ function refreshPopupStats() {
   });
 }
 
+document.getElementById("p-single-trigger").addEventListener("click", () => {
+  chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+    if (tabs[0]?.id) {
+      chrome.tabs.sendMessage(tabs[0].id, { action: "TRIGGER_SINGLE_FROM_POPUP" }, () => {
+        window.close();
+      });
+    }
+  });
+});
+
 document.getElementById("p-trigger").addEventListener("click", () => {
   chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
     if (tabs[0]?.id) {

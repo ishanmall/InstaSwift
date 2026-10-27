@@ -1,5 +1,5 @@
 if (navigator.locks && navigator.locks.request) {
-  navigator.locks.request("instaswift_v28_bg_lock", () => new Promise(() => {}));
+  navigator.locks.request("instaswift_v29_bg_lock", () => new Promise(() => {}));
 }
 
 let audioCtx = null;

@@ -57,13 +57,13 @@ async function ensureBackgroundKeepAlive(tabId) {
     } catch (__) {}
   }
   try {
-    chrome.alarms.create("instaswift_v28_watchdog", { periodInMinutes: 0.25 });
+    chrome.alarms.create("instaswift_v29_watchdog", { periodInMinutes: 0.25 });
   } catch (_) {}
 }
 
 async function closeBackgroundKeepAlive() {
   try {
-    chrome.alarms.clear("instaswift_v28_watchdog");
+    chrome.alarms.clear("instaswift_v29_watchdog");
     if (chrome.offscreen) {
       const hasDoc = await chrome.offscreen.hasDocument();
       if (hasDoc) await chrome.offscreen.closeDocument();
@@ -85,7 +85,7 @@ chrome.runtime.onConnect.addListener((port) => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "instaswift_v28_watchdog") {
+  if (alarm.name === "instaswift_v29_watchdog") {
     reconcileStalledDownloads();
     processQueue();
     broadcastStats();
@@ -230,12 +230,34 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     processQueue();
     sendResponse({ ok: true });
   }
+  // NEW: Dedicated Single-Video / Particular-Post Download Channel (Bypasses session lock & prioritizes at front of queue!)
+  else if (message.action === "QUEUE_SINGLE_MEDIA") {
+    ensureBackgroundKeepAlive(sender?.tab?.id);
+    const items = message.items || [];
+    for (const item of items) {
+      const cleanUser = (item.username || "instagram_videos").toLowerCase();
+      if (!stats.username) stats.username = cleanUser;
+      stats.scanned++;
+      // Push to the front of downloadQueue so the single clicked video downloads immediately!
+      downloadQueue.unshift({
+        ...item,
+        username: cleanUser,
+        isSinglePriority: true,
+        epoch: currentSessionEpoch,
+        retries: 0
+      });
+    }
+    stats.status = `Downloading Single Video/Post (${stats.downloaded} / ${stats.scanned})...`;
+    broadcastStats();
+    processQueue();
+    sendResponse({ ok: true });
+  }
   else if (message.action === "SCAN_FINISHED") {
     if (activeDownloads === 0 && downloadQueue.length === 0) {
       stats.status = "Completed";
       closeBackgroundKeepAlive();
     } else {
-      stats.status = `Downloading All (${stats.downloaded} / ${stats.scanned})...`;
+      stats.status = `Downloading (${stats.downloaded} / ${stats.scanned})...`;
     }
     broadcastStats();
     sendResponse({ ok: true });
@@ -271,7 +293,7 @@ function processQueue() {
   const burstCount = Math.min(2, maxAllowed - activeDownloads, downloadQueue.length);
   for (let i = 0; i < burstCount; i++) {
     const item = downloadQueue.shift();
-    if (!item || item.epoch !== currentSessionEpoch) continue;
+    if (!item || (!item.isSinglePriority && item.epoch !== currentSessionEpoch)) continue;
     activeDownloads++;
     startDownload(item);
   }
@@ -310,7 +332,7 @@ function startDownload(item) {
 
 function handleDownloadFailure(item) {
   activeDownloads = Math.max(0, downloadMap.size);
-  if (item.epoch !== currentSessionEpoch) {
+  if (!item.isSinglePriority && item.epoch !== currentSessionEpoch) {
     processQueue();
     return;
   }
@@ -323,7 +345,7 @@ function handleDownloadFailure(item) {
     item.retries++;
     const jitterBackoffMs = Math.floor(Math.random() * (400 * Math.pow(2, item.retries)));
     setTimeout(() => {
-      if (item.epoch === currentSessionEpoch && stats.status !== "Stopped") {
+      if ((item.isSinglePriority || item.epoch === currentSessionEpoch) && stats.status !== "Stopped") {
         downloadQueue.push(item);
         processQueue();
       }
@@ -385,10 +407,10 @@ chrome.downloads.onChanged.addListener((delta) => {
 function checkCompletion() {
   if (stats.status === "Stopped") return;
   if (activeDownloads === 0 && downloadQueue.length === 0 && stats.scanned > 0) {
-    stats.status = `✅ Download All Complete! Saved ${stats.downloaded} / ${stats.scanned} files.`;
+    stats.status = `✅ Download Complete! Saved ${stats.downloaded} / ${stats.scanned} files.`;
     closeBackgroundKeepAlive();
   } else if (stats.scanned > 0) {
-    stats.status = `Downloading All (${stats.downloaded} / ${stats.scanned} saved)...`;
+    stats.status = `Downloading (${stats.downloaded} / ${stats.scanned} saved)...`;
   }
 }
 

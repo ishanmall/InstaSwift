@@ -1,6 +1,6 @@
 (function () {
-  if (window.__instaswiftV28Loaded) return;
-  window.__instaswiftV28Loaded = true;
+  if (window.__instaswiftV29Loaded) return;
+  window.__instaswiftV29Loaded = true;
 
   try {
     Object.defineProperty(document, "hidden", { get: () => false, configurable: true });
@@ -30,7 +30,7 @@
     if (capturedGraphql.lsdToken) return capturedGraphql.lsdToken;
     const html = document.documentElement?.innerHTML || "";
     const m =
-      html.match(/["LSD",[],\{"token":"([^"]+)"\}/) ||
+      html.match(/\["LSD",\[\],\{"token":"([^"]+)"\}/) ||
       html.match(/"lsd":"([^"]+)"/) ||
       html.match(/name="lsd"\s+value="([^"]+)"/);
     if (m && m[1]) capturedGraphql.lsdToken = m[1];
@@ -255,6 +255,7 @@
     }
     else if (cmd === "FETCH_FULL_POST_BY_SHORTCODE") {
       const { shortcode, isReel } = payload;
+      // 1. Primary: Convert shortcode to numeric MediaPK and query `/api/v1/media/{pk}/info/`
       const derivedPk = shortcodeToMediaPk(shortcode);
       if (derivedPk) {
         const pkRes = await mainWorldJsonFetch(`https://www.instagram.com/api/v1/media/${encodeURIComponent(derivedPk)}/info/`);
@@ -263,6 +264,7 @@
           return;
         }
       }
+      // 2. Fallback: Query GraphQL PolarisPostActionLoadPostQueryV2 or ?__a=1&__d=dis
       const path = isReel ? "reel" : "p";
       const result = await mainWorldJsonFetch(`https://www.instagram.com/${path}/${encodeURIComponent(shortcode)}/?__a=1&__d=dis`);
       emitToContent("CMD_RESPONSE", { reqId, result });

@@ -5,7 +5,7 @@ let activeTargetUserId = "";
 let currentScanPhase = "posts"; // "posts" | "reels"
 
 // =========================================================
-// THE 3-SECTION STAGING ROOM ARCHITECTURE
+// THE 3-SECTION STAGING ROOM ARCHITECTURE (UNCHANGED)
 // Sec 1: Grid Vault (Set G)
 // Sec 2: Unique Reels Vault (Set R \ G)
 // Sec 3: Duplicate Quarantine Vault (Set G \cap R)
@@ -34,7 +34,7 @@ const stagingRoom = {
   }
 };
 
-// Passive Caches for HD Story Downloader & Single-Post Download Buttons
+// Passive Caches for Single Video/Post Downloader & HD Story Downloader
 const storyItemsByPk = new Map();
 const storyTraysByUser = new Map();
 const mediaCacheByShortcode = new Map();
@@ -233,6 +233,17 @@ function getUsernameFromUrl() {
   return null;
 }
 
+// Detects if the current browser URL is a specific Post or Reel (/p/SHORTCODE, /reel/SHORTCODE, /reels/SHORTCODE)
+function getActiveSinglePostFromUrl() {
+  const m = window.location.pathname.match(/\/(p|reel|reels|tv)\/([A-Za-z0-9_-]+)/);
+  if (!m) return null;
+  return {
+    type: m[1] === "p" ? "post" : "reel",
+    isReel: m[1] !== "p",
+    shortcode: m[2]
+  };
+}
+
 window.addEventListener("message", (event) => {
   if (event.source !== window || event.data?.source !== "INSTASWIFT_MAIN") return;
   const { type } = event.data;
@@ -244,7 +255,6 @@ window.addEventListener("message", (event) => {
     const payload = event.data.payload;
     if (!payload) return;
 
-    // Always index Stories & Media passively so Story Downloader has instant access to HD URLs
     indexPassiveMediaAndStories(payload);
 
     const pathUser = getUsernameFromPath(event.data.pagePath || window.location.pathname);
@@ -272,16 +282,23 @@ window.addEventListener("message", (event) => {
 });
 
 // =========================================================
-// UI INJECTORS: 1) Profile "Download All"  2) Story Bar  3) Per-Post "⬇ All"
+// UI INJECTORS:
+// 1) Profile "⚡ Download All"
+// 2) Particular Video/Post Modal & Page Button ("⚡ Download Video/Post")
+// 3) Reels Feed Floating Button ("⬇ Download Reel")
+// 4) Grid & Reels Thumbnail Hover Button ("⬇ Download")
+// 5) Manual Story Bar ("⬇ Download This Story")
 // =========================================================
 function runAllUiInjectors() {
   injectProfileButton();
-  injectManualStoryButtons();
+  injectSingleVideoModalAndPageButton();
+  injectReelsFeedActionButtons();
   injectGridPostDownloadButtons();
+  injectManualStoryButtons();
 }
 
 runAllUiInjectors();
-setInterval(runAllUiInjectors, 1000);
+setInterval(runAllUiInjectors, 900);
 const observer = new MutationObserver(() => runAllUiInjectors());
 if (document.body) {
   observer.observe(document.body, { childList: true, subtree: true });
@@ -313,7 +330,288 @@ function injectProfileButton() {
 }
 
 // =========================================================
-// RESTORED HD STORY & HIGHLIGHTS DOWNLOADER (NEVER DOWNLOADS PROFILE AVATAR!)
+// NEW: PARTICULAR SINGLE VIDEO / REEL / POST DOWNLOADER
+// Works on:
+// - Any open Post/Video/Reel modal dialog (/p/ABC or /reel/ABC)
+// - Standalone Post/Reel pages
+// - Reels feed player (/reels/ABC)
+// - Grid thumbnail hover button
+// =========================================================
+function injectSingleVideoModalAndPageButton() {
+  const singleRoute = getActiveSinglePostFromUrl();
+  if (!singleRoute) return;
+
+  const containers = document.querySelectorAll('div[role="dialog"], article, main');
+  for (const container of containers) {
+    if (container.querySelector(".is-single-modal-btn")) continue;
+
+    // Locate the action bar containing Like / Comment / Share / Save icons
+    const saveIcon = container.querySelector('svg[aria-label="Save"], svg[aria-label="Remove"]');
+    const likeIcon = container.querySelector('svg[aria-label="Like"], svg[aria-label="Unlike"]');
+    const anchorIcon = saveIcon || likeIcon;
+    if (!anchorIcon) continue;
+
+    const actionBar = anchorIcon.closest("section") || anchorIcon.parentElement?.parentElement?.parentElement;
+    if (!actionBar || actionBar.querySelector(".is-single-modal-btn")) continue;
+
+    const btn = document.createElement("button");
+    btn.className = "is-single-modal-btn";
+    btn.innerHTML = singleRoute.isReel ? "⚡ Download Video / Reel" : "⚡ Download Post / Video";
+    btn.title = "Download this particular video, reel, or multi-slide post in highest quality";
+
+    btn.addEventListener("click", async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const activeRoute = getActiveSinglePostFromUrl() || singleRoute;
+      await downloadParticularSingleMedia(activeRoute.shortcode, activeRoute.isReel, btn, container);
+    });
+
+    actionBar.appendChild(btn);
+  }
+}
+
+// Injects a "⬇ Reel" button inside the vertical `/reels/...` player sidebar
+function injectReelsFeedActionButtons() {
+  if (!window.location.pathname.startsWith("/reels/") && !window.location.pathname.startsWith("/reel/")) {
+    return;
+  }
+
+  const singleRoute = getActiveSinglePostFromUrl();
+  if (!singleRoute) return;
+
+  // Check if a floating single-reel button is already injected
+  let reelBar = document.getElementById("instaswift-single-reel-bar");
+  if (!reelBar) {
+    reelBar = document.createElement("div");
+    reelBar.id = "instaswift-single-reel-bar";
+    reelBar.innerHTML = `
+      <button id="is-dl-particular-reel" class="is-particular-reel-btn">🎬 Download This Video</button>
+    `;
+    document.body.appendChild(reelBar);
+
+    document.getElementById("is-dl-particular-reel").addEventListener("click", async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const btn = document.getElementById("is-dl-particular-reel");
+      const curr = getActiveSinglePostFromUrl();
+      if (curr) {
+        await downloadParticularSingleMedia(curr.shortcode, true, btn, document.body);
+      }
+    });
+  }
+}
+
+// Injects "⬇ Download" on every thumbnail in Profile Grid & Reels Grid for 1-click single video/post download
+function injectGridPostDownloadButtons() {
+  const anchors = document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]');
+  for (const a of anchors) {
+    if (a.dataset.instaswiftBound === "1") continue;
+    const match = (a.getAttribute("href") || "").match(/\/(p|reel)\/([A-Za-z0-9_-]+)/);
+    if (!match) continue;
+    if (!a.querySelector("img, video")) continue;
+
+    a.dataset.instaswiftBound = "1";
+    const isReel = match[1] === "reel";
+    const shortcode = match[2];
+
+    if (window.getComputedStyle(a).position === "static") {
+      a.style.position = "relative";
+    }
+
+    const postBtn = document.createElement("button");
+    postBtn.className = "is-grid-post-btn";
+    postBtn.title = "Download only this particular video/post";
+    postBtn.innerHTML = "⬇ Download";
+    postBtn.addEventListener("click", async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      await downloadParticularSingleMedia(shortcode, isReel, postBtn, a);
+    });
+
+    a.appendChild(postBtn);
+  }
+}
+
+// Core resolver & downloader for any particular Single Video, Reel, Photo, or Multi-Slide Carousel
+async function downloadParticularSingleMedia(shortcode, isReel, btnEl, domContainer = null) {
+  const origLabel = btnEl ? btnEl.innerHTML : "";
+  if (btnEl) {
+    btnEl.disabled = true;
+    btnEl.innerHTML = "⏳ Fetching...";
+  }
+
+  try {
+    const ownerFallback = (getUsernameFromUrl() || "instagram_videos").toLowerCase();
+    createOrShowHUD(ownerFallback);
+    updateHUDStatus(`Fetching HD stream for particular video/post (${shortcode})...`);
+
+    const singleItems = [];
+
+    // 1. Check passive cache first if it already has full video_versions / carousel_media
+    const cachedNode = mediaCacheByShortcode.get(shortcode);
+    if (
+      cachedNode &&
+      (cachedNode.video_versions?.length ||
+        cachedNode.carousel_media?.length ||
+        cachedNode.edge_sidecar_to_children?.edges?.length)
+    ) {
+      extractSinglePostSlides(cachedNode, ownerFallback, singleItems);
+    }
+
+    // 2. Query MAIN World API (`FETCH_FULL_POST_BY_SHORTCODE` -> `/api/v1/media/{pk}/info/`) for 1080p MP4 & all carousel slides
+    if (singleItems.length === 0) {
+      const res = await callMainWorld("FETCH_FULL_POST_BY_SHORTCODE", { shortcode, isReel }, 7500);
+      if (res?.ok && res.data) {
+        indexPassiveMediaAndStories(res.data, ownerFallback);
+        extractSinglePostSlides(res.data, ownerFallback, singleItems);
+      }
+    }
+
+    // 3. Scan embedded page JSON scripts if still not found
+    if (singleItems.length === 0) {
+      const scripts = document.querySelectorAll('script[type="application/json"], script:not([src])');
+      for (const s of scripts) {
+        const txt = (s.textContent || "").trim();
+        if (txt.startsWith("{") && txt.includes(shortcode)) {
+          try {
+            const parsed = JSON.parse(txt);
+            indexPassiveMediaAndStories(parsed, ownerFallback);
+            const foundNode = mediaCacheByShortcode.get(shortcode);
+            if (foundNode) {
+              extractSinglePostSlides(foundNode, ownerFallback, singleItems);
+              if (singleItems.length > 0) break;
+            }
+          } catch (_) {}
+        }
+      }
+    }
+
+    // 4. Direct DOM <video> / <img> Fallback if API was rate-limited
+    if (singleItems.length === 0 && domContainer) {
+      const vEl = domContainer.querySelector("video");
+      if (vEl && (vEl.currentSrc || vEl.src) && !(vEl.currentSrc || vEl.src).startsWith("blob:")) {
+        singleItems.push({
+          username: ownerFallback,
+          shortcode,
+          url: vEl.currentSrc || vEl.src,
+          filename: `${shortcode}.mp4`
+        });
+      } else {
+        const imgEl = domContainer.querySelector("img");
+        if (imgEl && imgEl.src && imgEl.src.startsWith("http")) {
+          singleItems.push({
+            username: ownerFallback,
+            shortcode,
+            url: imgEl.src,
+            filename: `${shortcode}.jpg`
+          });
+        }
+      }
+    }
+
+    if (singleItems.length === 0) {
+      updateHUDStatus(`⚠️ Could not extract direct stream for ${shortcode}. Try refreshing (F5).`);
+      if (btnEl) btnEl.innerHTML = "⚠️ Retry";
+      return;
+    }
+
+    const targetFolderUser = singleItems[0].username || ownerFallback;
+    await safeSendMessage({
+      action: "QUEUE_SINGLE_MEDIA",
+      items: singleItems
+    });
+
+    updateHUDStatus(
+      `✅ Downloading ${singleItems.length} file(s) from ${shortcode} to Instagram/${targetFolderUser}/!`
+    );
+    if (btnEl) btnEl.innerHTML = `✓ Saved (${singleItems.length})`;
+  } catch (err) {
+    updateHUDStatus(`Error downloading ${shortcode}: ${err.message}`);
+    if (btnEl) btnEl.innerHTML = "⚠️ Error";
+  } finally {
+    setTimeout(() => {
+      if (btnEl) {
+        btnEl.disabled = false;
+        btnEl.innerHTML = origLabel;
+      }
+    }, 2200);
+  }
+}
+
+function extractSinglePostSlides(rootObj, fallbackUser, outList) {
+  const visited = new WeakSet();
+  const addedKeys = new Set();
+
+  function walk(node) {
+    if (!node || typeof node !== "object" || visited.has(node)) return;
+    visited.add(node);
+    if (Array.isArray(node)) {
+      node.forEach(walk);
+      return;
+    }
+    const shortcode = node.code || node.shortcode;
+    if (
+      shortcode &&
+      (node.image_versions2 ||
+        node.video_versions ||
+        node.carousel_media ||
+        node.edge_sidecar_to_children ||
+        node.display_url ||
+        node.video_url)
+    ) {
+      const author = (node.user?.username || node.owner?.username || fallbackUser).toLowerCase();
+      const slides =
+        node.carousel_media ||
+        (node.edge_sidecar_to_children?.edges || []).map((e) => e?.node).filter(Boolean);
+
+      if (Array.isArray(slides) && slides.length > 0) {
+        slides.forEach((sl, idx) => {
+          const isVid =
+            sl.media_type === 2 ||
+            sl.is_video === true ||
+            sl.__typename === "GraphVideo" ||
+            sl.__typename === "XDTGraphVideo" ||
+            Boolean(sl.video_versions?.length);
+          const ext = extractStrictMediaUrl(sl, isVid);
+          const itemCode = `${shortcode}_${idx + 1}`;
+          if (ext && !addedKeys.has(itemCode)) {
+            addedKeys.add(itemCode);
+            outList.push({
+              username: author,
+              shortcode: itemCode,
+              url: ext.url,
+              filename: `${itemCode}.${ext.ext}`
+            });
+          }
+        });
+      } else {
+        const isVid =
+          node.media_type === 2 ||
+          node.is_video === true ||
+          node.product_type === "clips" ||
+          node.__typename === "GraphVideo" ||
+          node.__typename === "XDTGraphVideo" ||
+          Boolean(node.video_versions?.length);
+        const ext = extractStrictMediaUrl(node, isVid);
+        if (ext && !addedKeys.has(shortcode)) {
+          addedKeys.add(shortcode);
+          outList.push({
+            username: author,
+            shortcode,
+            url: ext.url,
+            filename: `${shortcode}.${ext.ext}`
+          });
+        }
+      }
+      return;
+    }
+    Object.keys(node).forEach((k) => walk(node[k]));
+  }
+  walk(rootObj);
+}
+
+// =========================================================
+// HD STORY & HIGHLIGHTS DOWNLOADER (UNCHANGED)
 // =========================================================
 function injectManualStoryButtons() {
   if (!window.location.pathname.startsWith("/stories/")) {
@@ -347,7 +645,6 @@ function injectManualStoryButtons() {
 
 async function downloadManualStories(downloadAllInReel = false) {
   const pathParts = window.location.pathname.split("/").filter(Boolean);
-  // /stories/<username>/<storyPk>/ or /stories/highlights/<highlightId>/
   const isHighlight = pathParts[1] === "highlights";
   const targetSlug = (pathParts[1] || "stories").toLowerCase();
   const urlStoryOrHighlightId = cleanPk(pathParts[2] || "");
@@ -355,7 +652,6 @@ async function downloadManualStories(downloadAllInReel = false) {
   createOrShowHUD(targetSlug);
   updateHUDStatus("Resolving HD Story Video/Photo...");
 
-  // 1. Scan embedded JSON scripts on the Story page
   const scripts = document.querySelectorAll('script[type="application/json"], script:not([src])');
   for (const s of scripts) {
     const txt = (s.textContent || "").trim();
@@ -366,7 +662,6 @@ async function downloadManualStories(downloadAllInReel = false) {
     }
   }
 
-  // 2. If user clicked "Download This Story" and URL has a numeric storyPk, fetch `/api/v1/media/{storyPk}/info/` directly!
   if (!downloadAllInReel && !isHighlight && urlStoryOrHighlightId && /^\d+$/.test(urlStoryOrHighlightId)) {
     if (!storyItemsByPk.has(urlStoryOrHighlightId)) {
       const mediaRes = await callMainWorld("FETCH_MEDIA_INFO", { mediaPk: urlStoryOrHighlightId }, 6500);
@@ -376,7 +671,6 @@ async function downloadManualStories(downloadAllInReel = false) {
     }
   }
 
-  // 3. Fetch full Story Reel Tray via `/api/v1/feed/reels_media/`
   if (isHighlight && urlStoryOrHighlightId) {
     const res = await callMainWorld("FETCH_STORIES_REEL", { reelId: `highlight:${urlStoryOrHighlightId}` }, 7000);
     if (res?.ok && res.data) indexPassiveMediaAndStories(res.data, targetSlug);
@@ -414,7 +708,6 @@ async function downloadManualStories(downloadAllInReel = false) {
     }
   }
 
-  // 4. Safe DOM Fallback (Strictly blocks profile avatars: alt*="profile picture" or width < 250px)
   if (batch.length === 0) {
     const domItem = extractValidStoryCanvasMediaFromDOM(targetSlug, urlStoryOrHighlightId);
     if (domItem) {
@@ -426,10 +719,9 @@ async function downloadManualStories(downloadAllInReel = false) {
   }
 
   await safeSendMessage({
-    action: "QUEUE_MEDIA",
+    action: "QUEUE_SINGLE_MEDIA",
     items: batch
   });
-  await safeSendMessage({ action: "SCAN_FINISHED" });
   updateHUDStatus(`✅ Downloading ${batch.length} HD Story file(s) to Instagram/${targetSlug}/!`);
 }
 
@@ -468,7 +760,6 @@ function extractValidStoryCanvasMediaFromDOM(targetSlug, fallbackId) {
     }
   }
 
-  // If a large MSE blob video is playing, never fall back to <img> (prevents grabbing the profile avatar!)
   if (videos.some((v) => v.clientHeight >= 250)) {
     return null;
   }
@@ -549,7 +840,14 @@ function indexPassiveMediaAndStories(rootObj, fallbackUsername = "") {
 
     const shortcode = node.code || node.shortcode;
     if (shortcode && hasMediaVersions) {
-      mediaCacheByShortcode.set(shortcode, node);
+      const existing = mediaCacheByShortcode.get(shortcode);
+      const hasRichMedia =
+        Boolean(node.video_versions?.length) ||
+        Boolean(node.carousel_media?.length) ||
+        Boolean(node.edge_sidecar_to_children?.edges?.length);
+      if (!existing || hasRichMedia) {
+        mediaCacheByShortcode.set(shortcode, node);
+      }
     }
 
     for (const k of Object.keys(node)) {
@@ -591,100 +889,7 @@ function recordStoryNode(node, ownerUser) {
 }
 
 // =========================================================
-// PER-POST "⬇ All" BUTTON ON GRID THUMBNAILS
-// =========================================================
-function injectGridPostDownloadButtons() {
-  const anchors = document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]');
-  for (const a of anchors) {
-    if (a.dataset.instaswiftBound === "1") continue;
-    const match = (a.getAttribute("href") || "").match(/\/(p|reel)\/([A-Za-z0-9_-]+)/);
-    if (!match) continue;
-    if (!a.querySelector("img, video")) continue;
-
-    a.dataset.instaswiftBound = "1";
-    const type = match[1];
-    const shortcode = match[2];
-
-    if (window.getComputedStyle(a).position === "static") {
-      a.style.position = "relative";
-    }
-
-    const postBtn = document.createElement("button");
-    postBtn.className = "is-grid-post-btn";
-    postBtn.title = "Download all slides in this post";
-    postBtn.innerHTML = "⬇ All";
-    postBtn.addEventListener("click", async (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      postBtn.disabled = true;
-      postBtn.innerHTML = "⏳";
-      const ownerFallback = (getUsernameFromUrl() || "instagram_saved").toLowerCase();
-      createOrShowHUD(ownerFallback);
-      const res = await callMainWorld("FETCH_FULL_POST_BY_SHORTCODE", { shortcode, isReel: type === "reel" }, 7000);
-      if (res?.ok && res.data) {
-        const singleItems = [];
-        extractSinglePostSlides(res.data, ownerFallback, singleItems);
-        if (singleItems.length > 0) {
-          await safeSendMessage({ action: "QUEUE_MEDIA", items: singleItems });
-          await safeSendMessage({ action: "SCAN_FINISHED" });
-          updateHUDStatus(`✅ Downloading ${singleItems.length} file(s) from post ${shortcode}!`);
-        }
-      }
-      postBtn.disabled = false;
-      postBtn.innerHTML = "⬇ All";
-    });
-
-    a.appendChild(postBtn);
-  }
-}
-
-function extractSinglePostSlides(rootObj, fallbackUser, outList) {
-  const visited = new WeakSet();
-  function walk(node) {
-    if (!node || typeof node !== "object" || visited.has(node)) return;
-    visited.add(node);
-    if (Array.isArray(node)) {
-      node.forEach(walk);
-      return;
-    }
-    const shortcode = node.code || node.shortcode;
-    if (shortcode && (node.image_versions2 || node.video_versions || node.carousel_media || node.edge_sidecar_to_children || node.display_url)) {
-      const author = (node.user?.username || node.owner?.username || fallbackUser).toLowerCase();
-      const slides = node.carousel_media || (node.edge_sidecar_to_children?.edges || []).map((e) => e?.node).filter(Boolean);
-      if (Array.isArray(slides) && slides.length > 0) {
-        slides.forEach((sl, idx) => {
-          const isVid = sl.media_type === 2 || sl.is_video === true || Boolean(sl.video_versions?.length);
-          const ext = extractStrictMediaUrl(sl, isVid);
-          if (ext) {
-            outList.push({
-              username: author,
-              shortcode: `${shortcode}_${idx + 1}`,
-              url: ext.url,
-              filename: `${shortcode}_${idx + 1}.${ext.ext}`
-            });
-          }
-        });
-      } else {
-        const isVid = node.media_type === 2 || node.is_video === true || Boolean(node.video_versions?.length);
-        const ext = extractStrictMediaUrl(node, isVid);
-        if (ext) {
-          outList.push({
-            username: author,
-            shortcode,
-            url: ext.url,
-            filename: `${shortcode}.${ext.ext}`
-          });
-        }
-      }
-      return;
-    }
-    Object.keys(node).forEach((k) => walk(node[k]));
-  }
-  walk(rootObj);
-}
-
-// =========================================================
-// THE 3-SECTION STAGING ROOM HUD
+// THE 3-SECTION STAGING ROOM HUD (UNCHANGED)
 // =========================================================
 function createOrShowHUD(username) {
   let hud = document.getElementById("instaswift-hud");
@@ -693,7 +898,7 @@ function createOrShowHUD(username) {
     hud.id = "instaswift-hud";
     hud.innerHTML = `
       <div class="is-hud-header">
-        <span class="is-hud-title">⚡ InstaSwift v28 Room — <strong id="is-hud-user">@${username}</strong></span>
+        <span class="is-hud-title">⚡ InstaSwift v29 Room — <strong id="is-hud-user">@${username}</strong></span>
         <button id="is-hud-close" title="Close">✕</button>
       </div>
       <div class="is-hud-status" id="is-hud-status">Initializing 3-Section Staging Room...</div>
@@ -711,7 +916,7 @@ function createOrShowHUD(username) {
           <span class="is-stat-lbl">Sec 3: Duplicates</span>
         </div>
       </div>
-      <div class="is-disk-line" id="is-disk-line">Staging Room: One-pass scan in progress...</div>
+      <div class="is-disk-line" id="is-disk-line">Ready for Single Video or 3-Room Profile Download</div>
       <button id="is-hud-stop" class="is-stop-btn">Stop</button>
     `;
     document.body.appendChild(hud);
@@ -750,7 +955,7 @@ function updateHUDStatus(text) {
 }
 
 try {
-  chrome.runtime.onMessage.addListener((msg) => {
+  chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.action === "STATS_UPDATE" && msg.stats) {
       const diskEl = document.getElementById("is-disk-line");
       const st = document.getElementById("is-hud-status");
@@ -765,6 +970,21 @@ try {
       engageTabBackgroundLock();
       const username = getUsernameFromUrl();
       if (username) startProfileDownload(username);
+    } else if (msg.action === "TRIGGER_SINGLE_FROM_POPUP") {
+      const singleRoute = getActiveSinglePostFromUrl();
+      if (singleRoute) {
+        downloadParticularSingleMedia(singleRoute.shortcode, singleRoute.isReel, null, document.body);
+        sendResponse({ ok: true, shortcode: singleRoute.shortcode });
+      } else {
+        sendResponse({ ok: false });
+      }
+      return false;
+    } else if (msg.action === "CHECK_ACTIVE_PAGE_CONTEXT") {
+      sendResponse({
+        singlePost: getActiveSinglePostFromUrl(),
+        profileUsername: getUsernameFromUrl()
+      });
+      return false;
     }
   });
 } catch (_) {}
@@ -817,10 +1037,7 @@ function scanEmbeddedPageScripts(usernameLower, phaseTag) {
 }
 
 // =========================================================
-// ONE-PASS 3-ROOM WORKFLOW (NO STOP-RESCAN-STOP LOOP!)
-// Pass 1: Continuous Grid Scan -> Sec 1
-// Pass 2: Continuous Reels Scan -> Sec 2 & Sec 3 (Duplicates)
-// Pass 3: Instant Bulk Download
+// ONE-PASS 3-ROOM WORKFLOW (UNCHANGED)
 // =========================================================
 async function startProfileDownload(username) {
   if (isScanning) return;
@@ -867,7 +1084,6 @@ async function startProfileDownload(username) {
 
     activeTargetUserId = findUserIdInDOM(activeTargetUsername);
 
-    // Fetch web_profile_info once at the start so activeTargetUserId is 100% locked before Reels Pass
     const profRes = await callMainWorld("FETCH_WEB_PROFILE_INFO", { username: activeTargetUsername }, 5000);
     if (profRes?.ok && profRes.data) {
       const u = profRes.data?.data?.user || profRes.data?.graphql?.user || profRes.data?.user;
@@ -888,34 +1104,24 @@ async function startProfileDownload(username) {
       }
     }
 
-    // ---------------------------------------------------------
-    // PASS 1: CONTINUOUS SINGLE-PASS GRID SCAN (Sec 1)
-    // ---------------------------------------------------------
     if (!stopRequested) {
       currentScanPhase = "posts";
       if (btn) btn.textContent = "⏳ Pass 1: Grid...";
       await scanGridSinglePass(username);
     }
 
-    // ---------------------------------------------------------
-    // PASS 2: CONTINUOUS SINGLE-PASS REELS SCAN (Sec 2 & Sec 3)
-    // ---------------------------------------------------------
     if (!stopRequested) {
       currentScanPhase = "reels";
       if (btn) btn.textContent = "⏳ Pass 2: Reels...";
       await scanReelsSinglePass(username);
     }
 
-    // Expand any truncated multi-slide carousels
     if (!stopRequested && pendingDeepResolvePks.size > 0) {
       await resolvePendingDeepMedia(activeTargetUsername);
     }
 
     if (stopRequested) return;
 
-    // ---------------------------------------------------------
-    // PASS 3: FLUSH STAGING ROOM -> HIGH-SPEED BULK DOWNLOAD
-    // ---------------------------------------------------------
     const finalBulkItems = [
       ...Array.from(stagingRoom.gridVault.values()),
       ...Array.from(stagingRoom.reelsVault.values())
@@ -964,7 +1170,6 @@ async function startProfileDownload(username) {
   }
 }
 
-// Continuous Single-Pass Grid Scanner (No stop-rescan loops!)
 async function scanGridSinglePass(username) {
   let maxId = null;
   let page = 0;
@@ -1008,14 +1213,12 @@ async function scanGridSinglePass(username) {
     }
   }
 
-  // Only scroll if REST API was blocked before finishing
   if (!stopRequested && !apiExhausted) {
     await switchProfileTab(username, "posts");
     await continuousNonStopScroll("posts");
   }
 }
 
-// Continuous Single-Pass Reels Scanner (REST Clips + GraphQL Clips — No per-item stop-rescan!)
 async function scanReelsSinglePass(username) {
   if (!activeTargetUserId) {
     activeTargetUserId = findUserIdInDOM(activeTargetUsername);
@@ -1026,7 +1229,6 @@ async function scanReelsSinglePass(username) {
   let apiExhausted = false;
   const seenCursors = new Set();
 
-  // 1. Primary Fast REST Clips Stream (`/api/v1/clips/user/`)
   if (activeTargetUserId) {
     while (!stopRequested) {
       page++;
@@ -1059,7 +1261,6 @@ async function scanReelsSinglePass(username) {
     }
   }
 
-  // 2. Secondary Fast GraphQL Clips Stream if REST stopped early
   if (!stopRequested && !apiExhausted && activeTargetUserId) {
     let afterCursor = null;
     let gqlPage = 0;
@@ -1094,14 +1295,12 @@ async function scanReelsSinglePass(username) {
     }
   }
 
-  // 3. If both APIs stopped early, switch to Reels tab and run one smooth continuous scroll (relying on passive GraphQL interception, NO per-anchor blocking!)
   if (!stopRequested && !apiExhausted) {
     await switchProfileTab(username, "reels");
     await continuousNonStopScroll("reels");
   }
 }
 
-// Strict 4-Tab Selector: Only clicks Grid (`/[user]/`) or Reels (`/[user]/reels/`), NEVER clicks Reposts or Tagged!
 async function switchProfileTab(username, section) {
   const lowerUser = username.toLowerCase();
   const allLinks = Array.from(document.querySelectorAll("a[href]"));
@@ -1125,7 +1324,6 @@ async function switchProfileTab(username, section) {
   return false;
 }
 
-// Fast Continuous Scroll (Zero per-item network calls -> Never pauses/rescans!)
 async function continuousNonStopScroll(phaseTag) {
   let idleTicks = 0;
   let lastTotalRoomSize =
@@ -1180,9 +1378,6 @@ async function resolvePendingDeepMedia(usernameLower) {
   }
 }
 
-// =========================================================
-// 3-ROOM PARTITION ROUTER (Places each item into Sec 1, Sec 2, or Sec 3)
-// =========================================================
 function routePayloadIntoStagingRoom(rootObj, targetUserLower, phaseTag = "posts") {
   const visited = new WeakSet();
 
@@ -1243,7 +1438,6 @@ function routePayloadIntoStagingRoom(rootObj, targetUserLower, phaseTag = "posts
 }
 
 function partitionMediaNodeIntoRoom(item, targetUserLower, phaseTag) {
-  // Strictly skip Reposts tab items!
   if (item.repost_info || item.original_media_id) return;
 
   const ownerUsername = (item.user?.username || item.owner?.username || "").toLowerCase();
