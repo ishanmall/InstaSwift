@@ -1,9 +1,9 @@
 {
   "manifest_version": 3,
-  "name": "InstaSwift v29.0 — 3-Room Bulk + Single Video & Story Downloader",
-  "version": "29.0.0",
+  "name": "InstaSwift v38.0 — 4-Engine Auto-Scroll + GraphQL Cloner 3-Room Downloader",
+  "version": "38.0.0",
   "minimum_chrome_version": "109",
-  "description": "One-pass Grid & Reels 3-Room Scanner + Particular Single Video/Reel/Post Downloader + HD Story Downloader.",
+  "description": "Bypasses 17-item rate-limit using Live GraphQL Request Cloning + High-Speed Auto-Scroll + 3-Room Deduplication.",
   "permissions": [
     "downloads",
     "activeTab",
@@ -35,6 +35,6 @@
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "InstaSwift v29.0"
+    "default_title": "InstaSwift v38.0"
   }
 }

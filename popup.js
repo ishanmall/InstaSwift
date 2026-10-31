@@ -33,4 +33,4 @@ document.getElementById("p-trigger").addEventListener("click", () => {
 });
 
 refreshPopupStats();
-setInterval(refreshPopupStats, 600);
+setInterval(refreshPopupStats, 500);

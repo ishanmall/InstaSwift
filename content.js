@@ -1,99 +1,21 @@
 let isScanning = false;
-let stopRequested = false;
-let activeTargetUsername = "";
-let activeTargetUserId = "";
-let currentScanPhase = "posts"; // "posts" | "reels"
 
-// =========================================================
-// THE 3-SECTION STAGING ROOM ARCHITECTURE (UNCHANGED)
-// Sec 1: Grid Vault (Set G)
-// Sec 2: Unique Reels Vault (Set R \ G)
-// Sec 3: Duplicate Quarantine Vault (Set G \cap R)
-// =========================================================
-const stagingRoom = {
-  gridVault: new Map(),
-  reelsVault: new Map(),
-  duplicateVault: new Map(),
-
-  gridFingerprints: new Set(),
-  gridShortcodes: new Set(),
-  gridMediaPks: new Set(),
-  gridBaseUrls: new Set(),
-
-  reelsFingerprints: new Set(),
-
-  reset() {
-    this.gridVault.clear();
-    this.reelsVault.clear();
-    this.duplicateVault.clear();
-    this.gridFingerprints.clear();
-    this.gridShortcodes.clear();
-    this.gridMediaPks.clear();
-    this.gridBaseUrls.clear();
-    this.reelsFingerprints.clear();
-  }
-};
-
-// Passive Caches for Single Video/Post Downloader & HD Story Downloader
 const storyItemsByPk = new Map();
 const storyTraysByUser = new Map();
 const mediaCacheByShortcode = new Map();
 
-function fnv1a64Hash(str) {
-  let h1 = 0xdeadbeef ^ str.length;
-  let h2 = 0x41c6ce57 ^ str.length;
-  for (let i = 0; i < str.length; i++) {
-    const c = str.charCodeAt(i);
-    h1 = Math.imul(h1 ^ c, 2654435761);
-    h2 = Math.imul(h2 ^ c, 1597334677);
-  }
-  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
-  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
-  return (h2 >>> 0).toString(16).padStart(8, "0") + (h1 >>> 0).toString(16).padStart(8, "0");
-}
-
-const pendingDeepResolvePks = new Map();
-const resolvedDeepPks = new Set();
-
-const scopedInterceptBuffer = [];
-let lastBufferUsername = "";
-
 const pendingRpcMap = new Map();
 let rpcCounter = 0;
 
-const IG_APP_ID = "936619743392459";
 const RESERVED_PATHS = new Set([
   "explore", "reels", "direct", "accounts", "p", "reel", "stories", "tv", "challenge"
 ]);
-
-let tabAudioCtx = null;
-function engageTabBackgroundLock() {
-  try {
-    if (navigator.locks && navigator.locks.request) {
-      navigator.locks.request("instaswift_tab_scan_lock", () => new Promise(() => {}));
-    }
-    if (!tabAudioCtx) {
-      const Ctx = window.AudioContext || window.webkitAudioContext;
-      if (Ctx) {
-        tabAudioCtx = new Ctx();
-        const osc = tabAudioCtx.createOscillator();
-        const gain = tabAudioCtx.createGain();
-        gain.gain.value = 0.00001;
-        osc.connect(gain);
-        gain.connect(tabAudioCtx.destination);
-        osc.start();
-      }
-    } else if (tabAudioCtx.state === "suspended") {
-      tabAudioCtx.resume().catch(() => {});
-    }
-  } catch (_) {}
-}
 
 function safeSendMessage(payload) {
   return new Promise((resolve) => {
     try {
       if (!chrome?.runtime?.id) {
-        updateHUDStatus("⚠️ Extension updated! Press F5 to refresh this page.");
+        updateHUDStatus("⚠️ Extension updated! Press F5 to refresh this Instagram page.");
         resolve(null);
         return;
       }
@@ -107,57 +29,7 @@ function safeSendMessage(payload) {
   });
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => {
-    let settled = false;
-    const done = () => {
-      if (!settled) {
-        settled = true;
-        resolve();
-      }
-    };
-    const localTimer = setTimeout(done, ms + 120);
-    try {
-      if (chrome?.runtime?.id) {
-        chrome.runtime.sendMessage({ action: "BG_UNTHROTTLED_SLEEP", ms }, () => {
-          clearTimeout(localTimer);
-          done();
-        });
-      }
-    } catch (_) {}
-  });
-}
-
-function getCsrfToken() {
-  const m = document.cookie.match(/csrftoken=([^;]+)/);
-  return m ? m[1] : "";
-}
-
-async function directContentJsonFetch(url, options = {}) {
-  try {
-    const res = await fetch(url, {
-      ...options,
-      headers: {
-        "x-ig-app-id": IG_APP_ID,
-        "x-csrftoken": getCsrfToken(),
-        "x-requested-with": "XMLHttpRequest",
-        "accept": "*/*",
-        ...(options.headers || {})
-      },
-      credentials: "include"
-    });
-    if (!res.ok) return { ok: false, status: res.status, data: null };
-    const txt = (await res.text()).trim();
-    if (!txt.startsWith("{") && !txt.startsWith("[")) {
-      return { ok: false, status: 200, data: null };
-    }
-    return { ok: true, status: 200, data: JSON.parse(txt) };
-  } catch (_) {
-    return { ok: false, status: 0, data: null };
-  }
-}
-
-function callMainWorld(cmd, payload, timeoutMs = 5500) {
+function callMainWorld(cmd, payload, timeoutMs = 8000) {
   return new Promise((resolve) => {
     const reqId = ++rpcCounter;
     let handled = false;
@@ -169,59 +41,13 @@ function callMainWorld(cmd, payload, timeoutMs = 5500) {
       resolve(val);
     };
 
-    sleep(timeoutMs).then(async () => {
-      if (!handled && pendingRpcMap.has(reqId)) {
-        const fallback = await runDirectFallback(cmd, payload);
-        finish(fallback);
-      }
-    });
+    setTimeout(() => {
+      if (!handled) finish({ ok: false, status: 408, data: null });
+    }, timeoutMs);
 
-    pendingRpcMap.set(reqId, (result) => {
-      finish(result);
-    });
-
+    pendingRpcMap.set(reqId, (result) => finish(result));
     window.postMessage({ source: "INSTASWIFT_CONTENT", cmd, reqId, payload }, "*");
   });
-}
-
-async function runDirectFallback(cmd, payload) {
-  if (cmd === "FETCH_POSTS_PAGE") {
-    const { username, userId, maxId } = payload;
-    const baseUrl = (userId && maxId)
-      ? `https://www.instagram.com/api/v1/feed/user/${encodeURIComponent(userId)}/`
-      : `https://www.instagram.com/api/v1/feed/user/${encodeURIComponent(username)}/username/`;
-    const url = new URL(baseUrl);
-    url.searchParams.set("count", "33");
-    if (maxId) url.searchParams.set("max_id", maxId);
-    return await directContentJsonFetch(url.toString());
-  }
-  if (cmd === "FETCH_REELS_PAGE") {
-    const { userId, maxId } = payload;
-    const body = new URLSearchParams({
-      target_user_id: String(userId),
-      page_size: "24",
-      include_feed_video: "true"
-    });
-    if (maxId) body.set("max_id", maxId);
-    return await directContentJsonFetch("https://www.instagram.com/api/v1/clips/user/", {
-      method: "POST",
-      headers: { "content-type": "application/x-www-form-urlencoded" },
-      body: body.toString()
-    });
-  }
-  if (cmd === "FETCH_MEDIA_INFO") {
-    return await directContentJsonFetch(`https://www.instagram.com/api/v1/media/${encodeURIComponent(payload.mediaPk)}/info/`);
-  }
-  return { ok: false, status: 408, data: null };
-}
-
-function getUsernameFromPath(pathname) {
-  const cleanPath = String(pathname || "").split("?")[0];
-  const parts = cleanPath.split("/").filter(Boolean);
-  if (parts.length >= 1 && !RESERVED_PATHS.has(parts[0].toLowerCase())) {
-    return parts[0].toLowerCase();
-  }
-  return null;
 }
 
 function getUsernameFromUrl() {
@@ -233,7 +59,6 @@ function getUsernameFromUrl() {
   return null;
 }
 
-// Detects if the current browser URL is a specific Post or Reel (/p/SHORTCODE, /reel/SHORTCODE, /reels/SHORTCODE)
 function getActiveSinglePostFromUrl() {
   const m = window.location.pathname.match(/\/(p|reel|reels|tv)\/([A-Za-z0-9_-]+)/);
   if (!m) return null;
@@ -244,51 +69,92 @@ function getActiveSinglePostFromUrl() {
   };
 }
 
-window.addEventListener("message", (event) => {
+function cleanPk(raw) {
+  if (!raw) return "";
+  return String(raw).split("_")[0].trim();
+}
+
+function findUserIdInDOM(usernameLower) {
+  const html = document.documentElement.innerHTML;
+  const escaped = usernameLower.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const regexes = [
+    new RegExp(`"id":"(\\d+)"[^}]{0,250}"username":"${escaped}"`, "i"),
+    new RegExp(`"username":"${escaped}"[^}]{0,250}"id":"(\\d+)"`, "i"),
+    new RegExp(`"pk":"(\\d+)"[^}]{0,250}"username":"${escaped}"`, "i"),
+    /"profilePage_(\d+)"/i
+  ];
+  for (const rx of regexes) {
+    const m = html.match(rx);
+    if (m && m[1]) return m[1];
+  }
+  return "";
+}
+
+window.addEventListener("message", async (event) => {
   if (event.source !== window || event.data?.source !== "INSTASWIFT_MAIN") return;
   const { type } = event.data;
 
   if (type === "CMD_RESPONSE") {
     const cb = pendingRpcMap.get(event.data.reqId);
     if (cb) cb(event.data.result);
-  } else if (type === "INTERCEPTED_JSON") {
-    const payload = event.data.payload;
-    if (!payload) return;
+  }
+  else if (type === "INTERCEPTED_JSON") {
+    if (event.data.payload) {
+      indexPassiveMediaAndStories(event.data.payload);
+    }
+  }
+  else if (type === "MAIN_SCAN_PROGRESS") {
+    const { status, gridCount, reelsCount, dupsCount } = event.data;
+    updateRoomHUDCounters(gridCount, reelsCount, dupsCount);
+    if (status) updateHUDStatus(status);
+    safeSendMessage({
+      action: "UPDATE_ROOM_COUNTS",
+      gridCount,
+      reelsCount,
+      dupsCount,
+      status
+    });
+  }
+  else if (type === "MAIN_SCAN_COMPLETE") {
+    const { username, gridCount, reelsCount, dupsCount, items } = event.data;
+    updateRoomHUDCounters(gridCount, reelsCount, dupsCount);
 
-    indexPassiveMediaAndStories(payload);
+    await safeSendMessage({
+      action: "UPDATE_ROOM_COUNTS",
+      gridCount,
+      reelsCount,
+      dupsCount
+    });
 
-    const pathUser = getUsernameFromPath(event.data.pagePath || window.location.pathname);
-    if (pathUser) {
-      if (pathUser !== lastBufferUsername) {
-        scopedInterceptBuffer.length = 0;
-        lastBufferUsername = pathUser;
-      }
-      scopedInterceptBuffer.push({
-        url: event.data.url || "",
-        pagePath: event.data.pagePath || "",
-        payload
+    if (!items || items.length === 0) {
+      isScanning = false;
+      resetButton();
+      await safeSendMessage({ action: "SCAN_FINISHED" });
+      updateHUDStatus("⚠️ No media found to download.");
+      return;
+    }
+
+    const btn = document.getElementById("instaswift-download-btn");
+    if (btn) btn.textContent = "🚀 Downloading Unique...";
+    updateHUDStatus(
+      `Deduplication Complete! Grid (G): ${gridCount} | Unique Reels (R\\G): ${reelsCount} | Dups Blocked (G∩R): ${dupsCount}. Downloading ${items.length} unique files...`
+    );
+
+    const PACKET_SIZE = 250;
+    for (let i = 0; i < items.length; i += PACKET_SIZE) {
+      const packet = items.slice(i, i + PACKET_SIZE);
+      await safeSendMessage({
+        action: "QUEUE_MEDIA",
+        items: packet
       });
-      if (scopedInterceptBuffer.length > 160) scopedInterceptBuffer.shift();
     }
 
-    if (isScanning && activeTargetUsername && (!pathUser || pathUser === activeTargetUsername)) {
-      const isClips =
-        (event.data.url || "").includes("clips") ||
-        (event.data.pagePath || "").includes("/reels") ||
-        Boolean(payload?.data?.xdt_api__v1__clips__user__connection_v2);
-      routePayloadIntoStagingRoom(payload, activeTargetUsername, isClips ? "reels" : currentScanPhase);
-    }
+    isScanning = false;
+    resetButton();
+    await safeSendMessage({ action: "SCAN_FINISHED" });
   }
 });
 
-// =========================================================
-// UI INJECTORS:
-// 1) Profile "⚡ Download All"
-// 2) Particular Video/Post Modal & Page Button ("⚡ Download Video/Post")
-// 3) Reels Feed Floating Button ("⬇ Download Reel")
-// 4) Grid & Reels Thumbnail Hover Button ("⬇ Download")
-// 5) Manual Story Bar ("⬇ Download This Story")
-// =========================================================
 function runAllUiInjectors() {
   injectProfileButton();
   injectSingleVideoModalAndPageButton();
@@ -321,7 +187,6 @@ function injectProfileButton() {
   btn.innerHTML = isScanning ? "⏳ Scanning..." : "⚡ Download All";
   btn.disabled = isScanning;
   btn.addEventListener("click", () => {
-    engageTabBackgroundLock();
     const currentUsername = getUsernameFromUrl();
     if (currentUsername) startProfileDownload(currentUsername);
   });
@@ -329,14 +194,49 @@ function injectProfileButton() {
   actionSection.appendChild(btn);
 }
 
-// =========================================================
-// NEW: PARTICULAR SINGLE VIDEO / REEL / POST DOWNLOADER
-// Works on:
-// - Any open Post/Video/Reel modal dialog (/p/ABC or /reel/ABC)
-// - Standalone Post/Reel pages
-// - Reels feed player (/reels/ABC)
-// - Grid thumbnail hover button
-// =========================================================
+async function startProfileDownload(username) {
+  if (isScanning) return;
+
+  if (
+    document.body.innerText.includes("This account is private") ||
+    document.body.innerText.includes("This Account is Private")
+  ) {
+    createOrShowHUD(username);
+    updateHUDStatus("🔒 Private profile: Account must be public to download.");
+    return;
+  }
+
+  isScanning = true;
+  createOrShowHUD(username);
+  updateHUDStatus("Initializing 4-Engine 3-Room Scanner (REST + Cloned GraphQL + Auto-Scroll)...");
+
+  const btn = document.getElementById("instaswift-download-btn");
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "⏳ Scanning...";
+  }
+
+  const initRes = await safeSendMessage({
+    action: "INIT_SESSION",
+    username: username.toLowerCase()
+  });
+  if (!initRes) {
+    isScanning = false;
+    resetButton();
+    updateHUDStatus("⚠️ Extension updated! Press F5 to refresh this tab.");
+    return;
+  }
+
+  window.postMessage(
+    {
+      source: "INSTASWIFT_CONTENT",
+      cmd: "START_MAIN_WORLD_3ROOM_SCAN",
+      payload: { username: username.toLowerCase() }
+    },
+    "*"
+  );
+}
+
 function injectSingleVideoModalAndPageButton() {
   const singleRoute = getActiveSinglePostFromUrl();
   if (!singleRoute) return;
@@ -345,7 +245,6 @@ function injectSingleVideoModalAndPageButton() {
   for (const container of containers) {
     if (container.querySelector(".is-single-modal-btn")) continue;
 
-    // Locate the action bar containing Like / Comment / Share / Save icons
     const saveIcon = container.querySelector('svg[aria-label="Save"], svg[aria-label="Remove"]');
     const likeIcon = container.querySelector('svg[aria-label="Like"], svg[aria-label="Unlike"]');
     const anchorIcon = saveIcon || likeIcon;
@@ -370,16 +269,16 @@ function injectSingleVideoModalAndPageButton() {
   }
 }
 
-// Injects a "⬇ Reel" button inside the vertical `/reels/...` player sidebar
 function injectReelsFeedActionButtons() {
   if (!window.location.pathname.startsWith("/reels/") && !window.location.pathname.startsWith("/reel/")) {
+    const existing = document.getElementById("instaswift-single-reel-bar");
+    if (existing) existing.remove();
     return;
   }
 
   const singleRoute = getActiveSinglePostFromUrl();
   if (!singleRoute) return;
 
-  // Check if a floating single-reel button is already injected
   let reelBar = document.getElementById("instaswift-single-reel-bar");
   if (!reelBar) {
     reelBar = document.createElement("div");
@@ -401,7 +300,6 @@ function injectReelsFeedActionButtons() {
   }
 }
 
-// Injects "⬇ Download" on every thumbnail in Profile Grid & Reels Grid for 1-click single video/post download
 function injectGridPostDownloadButtons() {
   const anchors = document.querySelectorAll('a[href*="/p/"], a[href*="/reel/"]');
   for (const a of anchors) {
@@ -432,7 +330,6 @@ function injectGridPostDownloadButtons() {
   }
 }
 
-// Core resolver & downloader for any particular Single Video, Reel, Photo, or Multi-Slide Carousel
 async function downloadParticularSingleMedia(shortcode, isReel, btnEl, domContainer = null) {
   const origLabel = btnEl ? btnEl.innerHTML : "";
   if (btnEl) {
@@ -447,7 +344,6 @@ async function downloadParticularSingleMedia(shortcode, isReel, btnEl, domContai
 
     const singleItems = [];
 
-    // 1. Check passive cache first if it already has full video_versions / carousel_media
     const cachedNode = mediaCacheByShortcode.get(shortcode);
     if (
       cachedNode &&
@@ -458,35 +354,14 @@ async function downloadParticularSingleMedia(shortcode, isReel, btnEl, domContai
       extractSinglePostSlides(cachedNode, ownerFallback, singleItems);
     }
 
-    // 2. Query MAIN World API (`FETCH_FULL_POST_BY_SHORTCODE` -> `/api/v1/media/{pk}/info/`) for 1080p MP4 & all carousel slides
     if (singleItems.length === 0) {
-      const res = await callMainWorld("FETCH_FULL_POST_BY_SHORTCODE", { shortcode, isReel }, 7500);
+      const res = await callMainWorld("FETCH_FULL_POST_BY_SHORTCODE", { shortcode, isReel }, 8000);
       if (res?.ok && res.data) {
         indexPassiveMediaAndStories(res.data, ownerFallback);
         extractSinglePostSlides(res.data, ownerFallback, singleItems);
       }
     }
 
-    // 3. Scan embedded page JSON scripts if still not found
-    if (singleItems.length === 0) {
-      const scripts = document.querySelectorAll('script[type="application/json"], script:not([src])');
-      for (const s of scripts) {
-        const txt = (s.textContent || "").trim();
-        if (txt.startsWith("{") && txt.includes(shortcode)) {
-          try {
-            const parsed = JSON.parse(txt);
-            indexPassiveMediaAndStories(parsed, ownerFallback);
-            const foundNode = mediaCacheByShortcode.get(shortcode);
-            if (foundNode) {
-              extractSinglePostSlides(foundNode, ownerFallback, singleItems);
-              if (singleItems.length > 0) break;
-            }
-          } catch (_) {}
-        }
-      }
-    }
-
-    // 4. Direct DOM <video> / <img> Fallback if API was rate-limited
     if (singleItems.length === 0 && domContainer) {
       const vEl = domContainer.querySelector("video");
       if (vEl && (vEl.currentSrc || vEl.src) && !(vEl.currentSrc || vEl.src).startsWith("blob:")) {
@@ -610,9 +485,6 @@ function extractSinglePostSlides(rootObj, fallbackUser, outList) {
   walk(rootObj);
 }
 
-// =========================================================
-// HD STORY & HIGHLIGHTS DOWNLOADER (UNCHANGED)
-// =========================================================
 function injectManualStoryButtons() {
   if (!window.location.pathname.startsWith("/stories/")) {
     const existingBar = document.getElementById("instaswift-story-bar");
@@ -652,19 +524,9 @@ async function downloadManualStories(downloadAllInReel = false) {
   createOrShowHUD(targetSlug);
   updateHUDStatus("Resolving HD Story Video/Photo...");
 
-  const scripts = document.querySelectorAll('script[type="application/json"], script:not([src])');
-  for (const s of scripts) {
-    const txt = (s.textContent || "").trim();
-    if (txt.startsWith("{") && (txt.includes("video_versions") || txt.includes("image_versions2") || txt.includes("reels_media"))) {
-      try {
-        indexPassiveMediaAndStories(JSON.parse(txt), targetSlug);
-      } catch (_) {}
-    }
-  }
-
   if (!downloadAllInReel && !isHighlight && urlStoryOrHighlightId && /^\d+$/.test(urlStoryOrHighlightId)) {
     if (!storyItemsByPk.has(urlStoryOrHighlightId)) {
-      const mediaRes = await callMainWorld("FETCH_MEDIA_INFO", { mediaPk: urlStoryOrHighlightId }, 6500);
+      const mediaRes = await callMainWorld("FETCH_MEDIA_INFO", { mediaPk: urlStoryOrHighlightId }, 7500);
       if (mediaRes?.ok && mediaRes.data) {
         indexPassiveMediaAndStories(mediaRes.data, targetSlug);
       }
@@ -672,17 +534,17 @@ async function downloadManualStories(downloadAllInReel = false) {
   }
 
   if (isHighlight && urlStoryOrHighlightId) {
-    const res = await callMainWorld("FETCH_STORIES_REEL", { reelId: `highlight:${urlStoryOrHighlightId}` }, 7000);
+    const res = await callMainWorld("FETCH_STORIES_REEL", { reelId: `highlight:${urlStoryOrHighlightId}` }, 7500);
     if (res?.ok && res.data) indexPassiveMediaAndStories(res.data, targetSlug);
   } else if (!isHighlight && targetSlug) {
     let uid = findUserIdInDOM(targetSlug);
     if (!uid) {
-      const profRes = await callMainWorld("FETCH_WEB_PROFILE_INFO", { username: targetSlug }, 6000);
+      const profRes = await callMainWorld("FETCH_WEB_PROFILE_INFO", { username: targetSlug }, 6500);
       const u = profRes?.data?.data?.user || profRes?.data?.graphql?.user || profRes?.data?.user;
       if (u) uid = cleanPk(u.id || u.pk);
     }
     if (uid) {
-      const sRes = await callMainWorld("FETCH_STORIES_REEL", { reelId: uid }, 7000);
+      const sRes = await callMainWorld("FETCH_STORIES_REEL", { reelId: uid }, 7500);
       if (sRes?.ok && sRes.data) indexPassiveMediaAndStories(sRes.data, targetSlug);
     }
   }
@@ -888,9 +750,6 @@ function recordStoryNode(node, ownerUser) {
   storyTraysByUser.get(sUser).set(pk, storyItem);
 }
 
-// =========================================================
-// THE 3-SECTION STAGING ROOM HUD (UNCHANGED)
-// =========================================================
 function createOrShowHUD(username) {
   let hud = document.getElementById("instaswift-hud");
   if (!hud) {
@@ -898,25 +757,25 @@ function createOrShowHUD(username) {
     hud.id = "instaswift-hud";
     hud.innerHTML = `
       <div class="is-hud-header">
-        <span class="is-hud-title">⚡ InstaSwift v29 Room — <strong id="is-hud-user">@${username}</strong></span>
+        <span class="is-hud-title">⚡ InstaSwift v38 Room — <strong id="is-hud-user">@${username}</strong></span>
         <button id="is-hud-close" title="Close">✕</button>
       </div>
-      <div class="is-hud-status" id="is-hud-status">Initializing 3-Section Staging Room...</div>
+      <div class="is-hud-status" id="is-hud-status">Initializing 4-Engine 3-Room Scanner...</div>
       <div class="is-hud-grid-3">
         <div class="is-stat-box is-room-grid">
           <span class="is-stat-val" id="is-stat-posts">0</span>
-          <span class="is-stat-lbl">Sec 1: Grid Vault</span>
+          <span class="is-stat-lbl">Room 1: Grid (G)</span>
         </div>
         <div class="is-stat-box is-room-reels">
           <span class="is-stat-val" id="is-stat-reels">0</span>
-          <span class="is-stat-lbl">Sec 2: Reels Vault</span>
+          <span class="is-stat-lbl">Room 2: Reels (R\\G)</span>
         </div>
         <div class="is-stat-box is-room-dups">
           <span class="is-stat-val" id="is-stat-dups">0</span>
-          <span class="is-stat-lbl">Sec 3: Duplicates</span>
+          <span class="is-stat-lbl">Room 3: Dups (G∩R)</span>
         </div>
       </div>
-      <div class="is-disk-line" id="is-disk-line">Ready for Single Video or 3-Room Profile Download</div>
+      <div class="is-disk-line" id="is-disk-line">Cloned GraphQL + Auto-Scroll + Observer Hook Active</div>
       <button id="is-hud-stop" class="is-stop-btn">Stop</button>
     `;
     document.body.appendChild(hud);
@@ -926,27 +785,26 @@ function createOrShowHUD(username) {
     });
 
     document.getElementById("is-hud-stop").addEventListener("click", async () => {
-      stopRequested = true;
       isScanning = false;
+      window.postMessage({ source: "INSTASWIFT_CONTENT", cmd: "STOP_MAIN_WORLD_SCAN" }, "*");
       await safeSendMessage({ action: "USER_EXPLICIT_STOP" });
-      updateHUDStatus("Stopped by user.");
+      updateHUDStatus("Stopped manually by user.");
       resetButton();
     });
   } else {
     hud.style.display = "block";
     document.getElementById("is-hud-user").textContent = `@${username}`;
   }
-  updateRoomHUDCounters();
 }
 
-function updateRoomHUDCounters() {
+function updateRoomHUDCounters(gridCount, reelsCount, dupsCount) {
   const pEl = document.getElementById("is-stat-posts");
   const rEl = document.getElementById("is-stat-reels");
   const dEl = document.getElementById("is-stat-dups");
 
-  if (pEl) pEl.textContent = stagingRoom.gridVault.size;
-  if (rEl) rEl.textContent = stagingRoom.reelsVault.size;
-  if (dEl) dEl.textContent = stagingRoom.duplicateVault.size;
+  if (pEl && gridCount !== undefined) pEl.textContent = gridCount;
+  if (rEl && reelsCount !== undefined) rEl.textContent = reelsCount;
+  if (dEl && dupsCount !== undefined) dEl.textContent = dupsCount;
 }
 
 function updateHUDStatus(text) {
@@ -957,17 +815,18 @@ function updateHUDStatus(text) {
 try {
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     if (msg.action === "STATS_UPDATE" && msg.stats) {
+      updateRoomHUDCounters(msg.stats.gridCount, msg.stats.reelsCount, msg.stats.dupsCount);
       const diskEl = document.getElementById("is-disk-line");
       const st = document.getElementById("is-hud-status");
       if (diskEl && msg.stats.scanned > 0) {
         const vel = msg.stats.velocityFps ? `${msg.stats.velocityFps} files/s` : "Max Speed";
-        diskEl.textContent = `Saved: ${msg.stats.downloaded} / ${msg.stats.scanned} • Speed: ${vel} (${msg.stats.concurrency || 6}x streams)`;
+        const accel = msg.stats.accelerationFps2 ? ` (a=${msg.stats.accelerationFps2}/s²)` : "";
+        diskEl.textContent = `Saved: ${msg.stats.downloaded}/${msg.stats.scanned} • v=${vel}${accel} • W=${msg.stats.concurrency || 8}x`;
       }
       if (st && !isScanning && msg.stats.status) {
         st.textContent = msg.stats.status;
       }
     } else if (msg.action === "TRIGGER_FROM_POPUP") {
-      engageTabBackgroundLock();
       const username = getUsernameFromUrl();
       if (username) startProfileDownload(username);
     } else if (msg.action === "TRIGGER_SINGLE_FROM_POPUP") {
@@ -979,655 +838,9 @@ try {
         sendResponse({ ok: false });
       }
       return false;
-    } else if (msg.action === "CHECK_ACTIVE_PAGE_CONTEXT") {
-      sendResponse({
-        singlePost: getActiveSinglePostFromUrl(),
-        profileUsername: getUsernameFromUrl()
-      });
-      return false;
     }
   });
 } catch (_) {}
-
-function cleanPk(raw) {
-  if (!raw) return "";
-  return String(raw).split("_")[0].trim();
-}
-
-function getBaseCdnPath(url) {
-  try {
-    return new URL(url).pathname;
-  } catch (_) {
-    return url;
-  }
-}
-
-function findUserIdInDOM(usernameLower) {
-  const html = document.documentElement.innerHTML;
-  const escaped = usernameLower.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const regexes = [
-    new RegExp(`"id":"(\\d+)"[^}]{0,250}"username":"${escaped}"`, "i"),
-    new RegExp(`"username":"${escaped}"[^}]{0,250}"id":"(\\d+)"`, "i"),
-    new RegExp(`"pk":"(\\d+)"[^}]{0,250}"username":"${escaped}"`, "i")
-  ];
-  for (const rx of regexes) {
-    const m = html.match(rx);
-    if (m && m[1]) return m[1];
-  }
-  return "";
-}
-
-function scanEmbeddedPageScripts(usernameLower, phaseTag) {
-  const scripts = document.querySelectorAll('script[type="application/json"], script:not([src])');
-  for (const s of scripts) {
-    const txt = (s.textContent || "").trim();
-    if (
-      txt.startsWith("{") &&
-      txt.toLowerCase().includes(`"${usernameLower}"`) &&
-      (txt.includes("xdt_api__v1__") ||
-        txt.includes("edge_owner_to_timeline_media") ||
-        txt.includes("video_versions") ||
-        txt.includes("image_versions2"))
-    ) {
-      try {
-        routePayloadIntoStagingRoom(JSON.parse(txt), usernameLower, phaseTag);
-      } catch (_) {}
-    }
-  }
-}
-
-// =========================================================
-// ONE-PASS 3-ROOM WORKFLOW (UNCHANGED)
-// =========================================================
-async function startProfileDownload(username) {
-  if (isScanning) return;
-  isScanning = true;
-  stopRequested = false;
-  activeTargetUsername = username.toLowerCase();
-  engageTabBackgroundLock();
-
-  stagingRoom.reset();
-  pendingDeepResolvePks.clear();
-  resolvedDeepPks.clear();
-
-  createOrShowHUD(username);
-  updateHUDStatus("Pass 1/2: Locking Profile ID & Scanning Grid Posts...");
-
-  const diskEl = document.getElementById("is-disk-line");
-  if (diskEl) {
-    diskEl.textContent = "One-Pass Room Active: Collecting Grid & Reels before bulk download...";
-  }
-
-  const btn = document.getElementById("instaswift-download-btn");
-  if (btn) {
-    btn.disabled = true;
-    btn.textContent = "⏳ Pass 1: Grid...";
-  }
-
-  try {
-    const initRes = await safeSendMessage({
-      action: "INIT_SESSION",
-      username: activeTargetUsername
-    });
-    if (!initRes) {
-      updateHUDStatus("⚠️ Please press F5 to refresh this Instagram tab.");
-      return;
-    }
-
-    if (
-      document.body.innerText.includes("This account is private") ||
-      document.body.innerText.includes("This Account is Private")
-    ) {
-      updateHUDStatus("🔒 Private profile: Account public hone par hi download hoga.");
-      return;
-    }
-
-    activeTargetUserId = findUserIdInDOM(activeTargetUsername);
-
-    const profRes = await callMainWorld("FETCH_WEB_PROFILE_INFO", { username: activeTargetUsername }, 5000);
-    if (profRes?.ok && profRes.data) {
-      const u = profRes.data?.data?.user || profRes.data?.graphql?.user || profRes.data?.user;
-      if (u && (u.id || u.pk)) {
-        activeTargetUserId = cleanPk(u.id || u.pk);
-      }
-      routePayloadIntoStagingRoom(profRes.data, activeTargetUsername, "posts");
-    }
-
-    const startsOnReelsTab = window.location.pathname.toLowerCase().includes("/reels");
-    currentScanPhase = startsOnReelsTab ? "reels" : "posts";
-
-    scanEmbeddedPageScripts(activeTargetUsername, currentScanPhase);
-    if (lastBufferUsername === activeTargetUsername) {
-      for (const entry of scopedInterceptBuffer) {
-        const isClips = (entry.url || "").includes("clips") || (entry.pagePath || "").includes("/reels");
-        routePayloadIntoStagingRoom(entry.payload, activeTargetUsername, isClips ? "reels" : "posts");
-      }
-    }
-
-    if (!stopRequested) {
-      currentScanPhase = "posts";
-      if (btn) btn.textContent = "⏳ Pass 1: Grid...";
-      await scanGridSinglePass(username);
-    }
-
-    if (!stopRequested) {
-      currentScanPhase = "reels";
-      if (btn) btn.textContent = "⏳ Pass 2: Reels...";
-      await scanReelsSinglePass(username);
-    }
-
-    if (!stopRequested && pendingDeepResolvePks.size > 0) {
-      await resolvePendingDeepMedia(activeTargetUsername);
-    }
-
-    if (stopRequested) return;
-
-    const finalBulkItems = [
-      ...Array.from(stagingRoom.gridVault.values()),
-      ...Array.from(stagingRoom.reelsVault.values())
-    ];
-
-    window.scrollTo(0, 0);
-    updateRoomHUDCounters();
-
-    await safeSendMessage({
-      action: "UPDATE_ROOM_COUNTS",
-      gridCount: stagingRoom.gridVault.size,
-      reelsCount: stagingRoom.reelsVault.size,
-      dupsCount: stagingRoom.duplicateVault.size
-    });
-
-    if (finalBulkItems.length === 0) {
-      await safeSendMessage({ action: "SCAN_FINISHED" });
-      updateHUDStatus("⚠️ No media found to download.");
-      return;
-    }
-
-    if (btn) btn.textContent = "🚀 Downloading All...";
-    updateHUDStatus(
-      `Room Ready! Grid: ${stagingRoom.gridVault.size} | Reels: ${stagingRoom.reelsVault.size} | Dups Blocked: ${stagingRoom.duplicateVault.size}. Downloading All...`
-    );
-
-    const PACKET_SIZE = 200;
-    for (let i = 0; i < finalBulkItems.length; i += PACKET_SIZE) {
-      if (stopRequested) break;
-      const packet = finalBulkItems.slice(i, i + PACKET_SIZE);
-      await safeSendMessage({
-        action: "QUEUE_MEDIA",
-        items: packet
-      });
-    }
-
-    if (!stopRequested) {
-      await safeSendMessage({ action: "SCAN_FINISHED" });
-    }
-  } catch (err) {
-    console.error("[InstaSwift Error]:", err);
-    updateHUDStatus(`Error: ${err.message}`);
-  } finally {
-    isScanning = false;
-    resetButton();
-  }
-}
-
-async function scanGridSinglePass(username) {
-  let maxId = null;
-  let page = 0;
-  let apiExhausted = false;
-  const seenCursors = new Set();
-
-  while (!stopRequested) {
-    page++;
-    updateHUDStatus(
-      `Pass 1 (Grid Section): Page ${page} • Sec 1 Vault: ${stagingRoom.gridVault.size} files...`
-    );
-
-    const res = await callMainWorld("FETCH_POSTS_PAGE", {
-      username,
-      userId: activeTargetUserId,
-      maxId
-    });
-
-    if (!res || !res.ok || !res.data) {
-      break;
-    }
-
-    const data = res.data;
-    if (!activeTargetUserId && data.user?.pk) {
-      activeTargetUserId = cleanPk(data.user.pk);
-    }
-    if (!activeTargetUserId && data.items?.[0]?.user?.pk) {
-      activeTargetUserId = cleanPk(data.items[0].user.pk);
-    }
-
-    routePayloadIntoStagingRoom(data, activeTargetUsername, "posts");
-
-    const nextCursor = data.next_max_id || data.paging_info?.max_id || null;
-    if (data.more_available && nextCursor && !seenCursors.has(String(nextCursor))) {
-      seenCursors.add(String(nextCursor));
-      maxId = String(nextCursor);
-      await sleep(320);
-    } else {
-      apiExhausted = true;
-      break;
-    }
-  }
-
-  if (!stopRequested && !apiExhausted) {
-    await switchProfileTab(username, "posts");
-    await continuousNonStopScroll("posts");
-  }
-}
-
-async function scanReelsSinglePass(username) {
-  if (!activeTargetUserId) {
-    activeTargetUserId = findUserIdInDOM(activeTargetUsername);
-  }
-
-  let maxId = null;
-  let page = 0;
-  let apiExhausted = false;
-  const seenCursors = new Set();
-
-  if (activeTargetUserId) {
-    while (!stopRequested) {
-      page++;
-      updateHUDStatus(
-        `Pass 2 (Reels Section): Page ${page} • Unique Reels: ${stagingRoom.reelsVault.size} | Dups: ${stagingRoom.duplicateVault.size}...`
-      );
-
-      const res = await callMainWorld("FETCH_REELS_PAGE", {
-        userId: activeTargetUserId,
-        maxId
-      });
-
-      if (!res || !res.ok || !res.data) {
-        break;
-      }
-
-      const data = res.data;
-      routePayloadIntoStagingRoom(data, activeTargetUsername, "reels");
-
-      const paging = data.paging_info || {};
-      const nextCursor = paging.max_id || data.next_max_id || null;
-      if ((paging.more_available || data.more_available) && nextCursor && !seenCursors.has(String(nextCursor))) {
-        seenCursors.add(String(nextCursor));
-        maxId = String(nextCursor);
-        await sleep(320);
-      } else {
-        apiExhausted = true;
-        break;
-      }
-    }
-  }
-
-  if (!stopRequested && !apiExhausted && activeTargetUserId) {
-    let afterCursor = null;
-    let gqlPage = 0;
-    const seenGqlCursors = new Set();
-
-    while (!stopRequested) {
-      gqlPage++;
-      updateHUDStatus(
-        `Pass 2 (Reels GraphQL): Page ${gqlPage} • Unique Reels: ${stagingRoom.reelsVault.size} | Dups: ${stagingRoom.duplicateVault.size}...`
-      );
-
-      const res = await callMainWorld("FETCH_REELS_GRAPHQL", {
-        userId: activeTargetUserId,
-        afterCursor
-      });
-
-      const conn = res?.data?.data?.xdt_api__v1__clips__user__connection_v2;
-      if (!conn) break;
-
-      routePayloadIntoStagingRoom(res.data, activeTargetUsername, "reels");
-
-      const hasNext = Boolean(conn.page_info?.has_next_page);
-      const endCursor = conn.page_info?.end_cursor || null;
-      if (hasNext && endCursor && !seenGqlCursors.has(String(endCursor))) {
-        seenGqlCursors.add(String(endCursor));
-        afterCursor = String(endCursor);
-        await sleep(320);
-      } else {
-        apiExhausted = true;
-        break;
-      }
-    }
-  }
-
-  if (!stopRequested && !apiExhausted) {
-    await switchProfileTab(username, "reels");
-    await continuousNonStopScroll("reels");
-  }
-}
-
-async function switchProfileTab(username, section) {
-  const lowerUser = username.toLowerCase();
-  const allLinks = Array.from(document.querySelectorAll("a[href]"));
-
-  const targetLink = allLinks.find((a) => {
-    const rawHref = (a.getAttribute("href") || "").toLowerCase();
-    const cleanHref = rawHref.split("?")[0].replace(/\/$/, "");
-    if (section === "reels") {
-      return cleanHref === `/${lowerUser}/reels`;
-    } else {
-      return cleanHref === `/${lowerUser}`;
-    }
-  });
-
-  if (targetLink) {
-    targetLink.click();
-    await sleep(1000);
-    scanEmbeddedPageScripts(activeTargetUsername, section);
-    return true;
-  }
-  return false;
-}
-
-async function continuousNonStopScroll(phaseTag) {
-  let idleTicks = 0;
-  let lastTotalRoomSize =
-    stagingRoom.gridVault.size + stagingRoom.reelsVault.size + stagingRoom.duplicateVault.size;
-  let lastScrollHeight = 0;
-
-  while (!stopRequested && idleTicks < 5) {
-    window.scrollTo(0, document.body.scrollHeight);
-    window.dispatchEvent(new Event("scroll", { bubbles: true }));
-    await sleep(700);
-
-    const hasSpinner = Boolean(
-      document.querySelector('main [role="progressbar"], main svg[aria-label="Loading..."]')
-    );
-
-    const currentRoomSize =
-      stagingRoom.gridVault.size + stagingRoom.reelsVault.size + stagingRoom.duplicateVault.size;
-    const currentHeight = document.body.scrollHeight;
-
-    updateHUDStatus(
-      `Fast Scrolling ${phaseTag.toUpperCase()} • Sec1: ${stagingRoom.gridVault.size} | Sec2: ${stagingRoom.reelsVault.size} | Sec3 Dups: ${stagingRoom.duplicateVault.size}`
-    );
-
-    if (currentRoomSize > lastTotalRoomSize || currentHeight > lastScrollHeight) {
-      idleTicks = 0;
-      lastTotalRoomSize = currentRoomSize;
-      lastScrollHeight = currentHeight;
-    } else if (hasSpinner) {
-      await sleep(750);
-      idleTicks++;
-    } else {
-      idleTicks++;
-    }
-  }
-}
-
-async function resolvePendingDeepMedia(usernameLower) {
-  const entries = Array.from(pendingDeepResolvePks.entries()).filter(([pk]) => !resolvedDeepPks.has(pk));
-  let idx = 0;
-
-  for (const [pk, phaseTag] of entries) {
-    if (stopRequested) break;
-    idx++;
-    resolvedDeepPks.add(pk);
-    updateHUDStatus(`Expanding Carousel (${idx}/${entries.length})...`);
-
-    const res = await callMainWorld("FETCH_MEDIA_INFO", { mediaPk: pk });
-    if (res && res.ok && res.data) {
-      routePayloadIntoStagingRoom(res.data, usernameLower, phaseTag);
-    }
-    await sleep(350);
-  }
-}
-
-function routePayloadIntoStagingRoom(rootObj, targetUserLower, phaseTag = "posts") {
-  const visited = new WeakSet();
-
-  function walk(node, activePhase = phaseTag) {
-    if (!node || typeof node !== "object") return;
-    if (visited.has(node)) return;
-    visited.add(node);
-
-    if (Array.isArray(node)) {
-      for (const item of node) walk(item, activePhase);
-      return;
-    }
-
-    if (node.reels_media || node.tray || node.story_ranking_token) return;
-
-    if (node.xdt_api__v1__clips__user__connection_v2) {
-      walk(node.xdt_api__v1__clips__user__connection_v2, "reels");
-      return;
-    }
-    if (node.xdt_api__v1__feed__user_timeline_graphql_connection || node.edge_owner_to_timeline_media) {
-      walk(
-        node.xdt_api__v1__feed__user_timeline_graphql_connection || node.edge_owner_to_timeline_media,
-        "posts"
-      );
-      return;
-    }
-
-    if (node.media && typeof node.media === "object" && (node.media.code || node.media.pk || node.media.shortcode)) {
-      walk(node.media, activePhase);
-    }
-
-    const shortcode = node.code || node.shortcode;
-    const isMediaItem =
-      shortcode &&
-      !node.expiring_at &&
-      (node.media_type !== undefined ||
-        node.__typename ||
-        node.image_versions2 ||
-        node.video_versions ||
-        node.carousel_media ||
-        node.edge_sidecar_to_children ||
-        node.display_url ||
-        node.video_url);
-
-    if (isMediaItem) {
-      partitionMediaNodeIntoRoom(node, targetUserLower, activePhase);
-      return;
-    }
-
-    for (const k of Object.keys(node)) {
-      if (k === "reels_media" || k === "stories") continue;
-      walk(node[k], activePhase);
-    }
-  }
-
-  walk(rootObj, phaseTag);
-  updateRoomHUDCounters();
-}
-
-function partitionMediaNodeIntoRoom(item, targetUserLower, phaseTag) {
-  if (item.repost_info || item.original_media_id) return;
-
-  const ownerUsername = (item.user?.username || item.owner?.username || "").toLowerCase();
-  const ownerPk = cleanPk(item.user?.pk || item.user?.id || item.owner?.id || item.owner?.pk);
-
-  if (ownerUsername === targetUserLower && ownerPk && !activeTargetUserId) {
-    activeTargetUserId = ownerPk;
-  }
-
-  let isTargetOwner = false;
-  if (ownerUsername === targetUserLower) {
-    isTargetOwner = true;
-  } else if (!ownerUsername && activeTargetUserId && ownerPk === activeTargetUserId) {
-    isTargetOwner = true;
-  } else {
-    const coauthors = [
-      ...(Array.isArray(item.coauthor_producers) ? item.coauthor_producers : []),
-      ...(Array.isArray(item.invited_coauthor_producers) ? item.invited_coauthor_producers : [])
-    ];
-    for (const ca of coauthors) {
-      if ((ca?.username || "").toLowerCase() === targetUserLower) {
-        isTargetOwner = true;
-        break;
-      }
-    }
-  }
-
-  if (!isTargetOwner) return;
-
-  const shortcode = String(item.code || item.shortcode).trim();
-  const mediaPk = cleanPk(item.pk || item.id);
-
-  const isCarousel =
-    item.media_type === 8 ||
-    item.__typename === "GraphSidecar" ||
-    item.__typename === "XDTGraphSidecar" ||
-    Array.isArray(item.carousel_media) ||
-    Boolean(item.edge_sidecar_to_children);
-
-  if (isCarousel) {
-    const slides =
-      item.carousel_media ||
-      (item.edge_sidecar_to_children?.edges || []).map((e) => e?.node).filter(Boolean) ||
-      [];
-
-    const expectedCount = item.carousel_media_count || slides.length;
-    if ((slides.length === 0 || slides.length < expectedCount) && mediaPk && !resolvedDeepPks.has(mediaPk)) {
-      pendingDeepResolvePks.set(mediaPk, phaseTag);
-      return;
-    }
-
-    slides.forEach((slide, index) => {
-      const slideNum = index + 1;
-      const slideKey = `${shortcode}_slide_${slideNum}`;
-      const slidePk = cleanPk(slide.pk || slide.id) || `${mediaPk}_s${slideNum}`;
-
-      const slideIsVideo =
-        slide.media_type === 2 ||
-        slide.is_video === true ||
-        slide.__typename === "GraphVideo" ||
-        slide.__typename === "XDTGraphVideo" ||
-        (Array.isArray(slide.video_versions) && slide.video_versions.length > 0);
-
-      const extracted = extractStrictMediaUrl(slide, slideIsVideo);
-      if (!extracted) {
-        if (slideIsVideo && mediaPk && !resolvedDeepPks.has(mediaPk)) {
-          pendingDeepResolvePks.set(mediaPk, phaseTag);
-        }
-        return;
-      }
-
-      const baseUrl = getBaseCdnPath(extracted.url);
-      const filename = `${shortcode}_${slideNum}.${extracted.ext}`;
-      const fpHash = fnv1a64Hash(`${slidePk}|${slideKey}|${baseUrl}`);
-
-      const mediaRecord = {
-        username: targetUserLower,
-        shortcode: `${shortcode}_${slideNum}`,
-        url: extracted.url,
-        filename
-      };
-
-      placeSlideIntoRoomSection(
-        phaseTag,
-        shortcode,
-        slideKey,
-        slidePk,
-        baseUrl,
-        fpHash,
-        true,
-        mediaRecord
-      );
-    });
-    return;
-  }
-
-  const singleSlideKey = `${shortcode}_slide_1`;
-  const singlePk = mediaPk || shortcode;
-
-  const isVideoItem =
-    item.media_type === 2 ||
-    item.is_video === true ||
-    item.product_type === "clips" ||
-    item.product_type === "igtv" ||
-    item.__typename === "GraphVideo" ||
-    item.__typename === "XDTGraphVideo" ||
-    (Array.isArray(item.video_versions) && item.video_versions.length > 0);
-
-  const extracted = extractStrictMediaUrl(item, isVideoItem);
-  if (!extracted) {
-    if (isVideoItem && mediaPk && !resolvedDeepPks.has(mediaPk)) {
-      pendingDeepResolvePks.set(mediaPk, phaseTag);
-    }
-    return;
-  }
-
-  const baseUrl = getBaseCdnPath(extracted.url);
-  const filename = `${shortcode}.${extracted.ext}`;
-  const fpHash = fnv1a64Hash(`${singlePk}|${singleSlideKey}|${baseUrl}`);
-
-  const mediaRecord = {
-    username: targetUserLower,
-    shortcode,
-    url: extracted.url,
-    filename
-  };
-
-  placeSlideIntoRoomSection(
-    phaseTag,
-    shortcode,
-    singleSlideKey,
-    singlePk,
-    baseUrl,
-    fpHash,
-    false,
-    mediaRecord
-  );
-}
-
-function placeSlideIntoRoomSection(
-  phaseTag,
-  rootShortcode,
-  slideKey,
-  mediaPk,
-  baseUrl,
-  fpHash,
-  isCarousel,
-  mediaRecord
-) {
-  if (phaseTag === "posts") {
-    if (
-      stagingRoom.gridVault.has(slideKey) ||
-      stagingRoom.gridFingerprints.has(fpHash) ||
-      stagingRoom.gridMediaPks.has(mediaPk) ||
-      stagingRoom.gridBaseUrls.has(baseUrl)
-    ) {
-      return;
-    }
-
-    stagingRoom.gridVault.set(slideKey, mediaRecord);
-    stagingRoom.gridFingerprints.add(fpHash);
-    stagingRoom.gridMediaPks.add(mediaPk);
-    stagingRoom.gridBaseUrls.add(baseUrl);
-    if (!isCarousel) stagingRoom.gridShortcodes.add(rootShortcode);
-
-    if (stagingRoom.reelsVault.has(slideKey)) {
-      stagingRoom.reelsVault.delete(slideKey);
-      stagingRoom.duplicateVault.set(slideKey, mediaRecord);
-    }
-  } else {
-    const existsInGridVault =
-      stagingRoom.gridVault.has(slideKey) ||
-      stagingRoom.gridShortcodes.has(rootShortcode) ||
-      stagingRoom.gridFingerprints.has(fpHash) ||
-      stagingRoom.gridMediaPks.has(mediaPk) ||
-      stagingRoom.gridBaseUrls.has(baseUrl);
-
-    if (existsInGridVault) {
-      stagingRoom.duplicateVault.set(slideKey, mediaRecord);
-      return;
-    }
-
-    if (stagingRoom.reelsVault.has(slideKey) || stagingRoom.reelsFingerprints.has(fpHash)) {
-      return;
-    }
-
-    stagingRoom.reelsVault.set(slideKey, mediaRecord);
-    stagingRoom.reelsFingerprints.add(fpHash);
-  }
-}
 
 function extractStrictMediaUrl(node, mustBeVideo) {
   if (!node) return null;

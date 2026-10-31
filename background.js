@@ -2,19 +2,23 @@ let downloadQueue = [];
 let activeDownloads = 0;
 let isPacing = false;
 
-let adaptiveConcurrency = 6;
-const MIN_CONCURRENCY = 3;
-const MAX_CONCURRENCY = 10;
+let adaptiveConcurrency = 8;
+const MIN_CONCURRENCY = 4;
+const MAX_CONCURRENCY = 16;
 
-let adaptiveGapMs = 60;
+let adaptiveGapMs = 30;
 const EWMA_ALPHA = 0.35;
 let ewmaVelocityFps = 0;
+let prevVelocityFps = 0;
+let accelerationFps2 = 0;
+let ewmaDownloadRttSec = 0.85;
 let lastCompletionWindowTs = Date.now();
 let completionsInWindow = 0;
 
 let currentSessionEpoch = 0;
 const sessionFileLock = new Set();
 const sessionShortcodeLock = new Set();
+const sessionUrlPathLock = new Set();
 const downloadMap = new Map();
 
 let stats = {
@@ -26,8 +30,9 @@ let stats = {
   scanned: 0,
   downloaded: 0,
   failed: 0,
-  concurrency: 6,
-  velocityFps: 0
+  concurrency: 8,
+  velocityFps: 0,
+  accelerationFps2: 0
 };
 
 async function ensureBackgroundKeepAlive(tabId) {
@@ -43,7 +48,7 @@ async function ensureBackgroundKeepAlive(tabId) {
         await chrome.offscreen.createDocument({
           url: "offscreen.html",
           reasons: ["AUDIO_PLAYBACK", "BLOBS"],
-          justification: "Keep InstaSwift 3-Room bulk download engine active in background."
+          justification: "Keep InstaSwift 3-Room Instagram scanner & downloader active in background until manually closed."
         });
       }
     }
@@ -52,22 +57,12 @@ async function ensureBackgroundKeepAlive(tabId) {
       await chrome.offscreen.createDocument({
         url: "offscreen.html",
         reasons: ["BLOBS"],
-        justification: "Keep background download queue active."
+        justification: "Keep background scan & download queue active."
       });
     } catch (__) {}
   }
   try {
-    chrome.alarms.create("instaswift_v29_watchdog", { periodInMinutes: 0.25 });
-  } catch (_) {}
-}
-
-async function closeBackgroundKeepAlive() {
-  try {
-    chrome.alarms.clear("instaswift_v29_watchdog");
-    if (chrome.offscreen) {
-      const hasDoc = await chrome.offscreen.hasDocument();
-      if (hasDoc) await chrome.offscreen.closeDocument();
-    }
+    chrome.alarms.create("instaswift_v38_watchdog", { periodInMinutes: 0.25 });
   } catch (_) {}
 }
 
@@ -85,7 +80,7 @@ chrome.runtime.onConnect.addListener((port) => {
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === "instaswift_v29_watchdog") {
+  if (alarm.name === "instaswift_v38_watchdog") {
     reconcileStalledDownloads();
     processQueue();
     broadcastStats();
@@ -95,7 +90,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
 function reconcileStalledDownloads() {
   const now = Date.now();
   for (const [dlId, entry] of downloadMap.entries()) {
-    if (now - entry.startedAt > 18000) {
+    if (now - entry.startedAt > 16000) {
       chrome.downloads.search({ id: dlId }, (results) => {
         if (chrome.runtime.lastError || !results || results.length === 0) {
           if (downloadMap.has(dlId)) {
@@ -145,6 +140,14 @@ function buildSafeRelativePath(username, filename) {
   return `Instagram/${safeUser}/${base}.${ext}`;
 }
 
+function getNormalizedUrlPath(url) {
+  try {
+    return new URL(url).pathname;
+  } catch (_) {
+    return String(url || "");
+  }
+}
+
 chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
   if (downloadMap.has(downloadItem.id)) {
     const entry = downloadMap.get(downloadItem.id);
@@ -159,13 +162,7 @@ chrome.downloads.onDeterminingFilename.addListener((downloadItem, suggest) => {
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.action === "BG_UNTHROTTLED_SLEEP") {
-    setTimeout(() => {
-      sendResponse({ ok: true });
-    }, Math.max(10, Number(message.ms) || 300));
-    return true;
-  }
-  else if (message.action === "INIT_SESSION") {
+  if (message.action === "INIT_SESSION") {
     const incomingUser = (message.username || "").toLowerCase();
     currentSessionEpoch++;
     ensureBackgroundKeepAlive(sender?.tab?.id);
@@ -177,34 +174,41 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     activeDownloads = 0;
     isPacing = false;
-    adaptiveConcurrency = 6;
-    adaptiveGapMs = 60;
+    adaptiveConcurrency = 8;
+    adaptiveGapMs = 30;
     ewmaVelocityFps = 0;
+    prevVelocityFps = 0;
+    accelerationFps2 = 0;
+    ewmaDownloadRttSec = 0.85;
     completionsInWindow = 0;
     lastCompletionWindowTs = Date.now();
+
     sessionFileLock.clear();
     sessionShortcodeLock.clear();
+    sessionUrlPathLock.clear();
 
     stats = {
       username: incomingUser,
-      status: "One-Pass Room Active: Scanning...",
+      status: "4-Engine 3-Room Active: Step 1 Grid -> Step 2 Reels -> Step 3 Dedup",
       gridCount: 0,
       reelsCount: 0,
       dupsCount: 0,
       scanned: 0,
       downloaded: 0,
       failed: 0,
-      concurrency: 6,
-      velocityFps: 0
+      concurrency: 8,
+      velocityFps: 0,
+      accelerationFps2: 0
     };
 
     broadcastStats();
     sendResponse({ ok: true });
   }
   else if (message.action === "UPDATE_ROOM_COUNTS") {
-    stats.gridCount = message.gridCount || 0;
-    stats.reelsCount = message.reelsCount || 0;
-    stats.dupsCount = message.dupsCount || 0;
+    stats.gridCount = message.gridCount ?? stats.gridCount;
+    stats.reelsCount = message.reelsCount ?? stats.reelsCount;
+    stats.dupsCount = message.dupsCount ?? stats.dupsCount;
+    if (message.status) stats.status = message.status;
     broadcastStats();
     sendResponse({ ok: true });
   }
@@ -215,22 +219,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const cleanUser = (item.username || "").toLowerCase();
       const fileKey = `${cleanUser}/${item.filename}`;
       const codeKey = `${cleanUser}/${item.shortcode || item.filename}`;
+      const urlPathKey = `${cleanUser}/${getNormalizedUrlPath(item.url)}`;
 
-      if (sessionFileLock.has(fileKey) || sessionShortcodeLock.has(codeKey)) {
+      if (
+        sessionFileLock.has(fileKey) ||
+        sessionShortcodeLock.has(codeKey) ||
+        sessionUrlPathLock.has(urlPathKey)
+      ) {
         continue;
       }
 
       sessionFileLock.add(fileKey);
       sessionShortcodeLock.add(codeKey);
+      sessionUrlPathLock.add(urlPathKey);
       stats.scanned++;
       downloadQueue.push({ ...item, epoch: currentSessionEpoch, retries: 0 });
     }
-    stats.status = `Downloading All (${stats.downloaded} / ${stats.scanned})...`;
+    stats.status = `Downloading Unique Set (${stats.downloaded} / ${stats.scanned})...`;
     broadcastStats();
     processQueue();
     sendResponse({ ok: true });
   }
-  // NEW: Dedicated Single-Video / Particular-Post Download Channel (Bypasses session lock & prioritizes at front of queue!)
   else if (message.action === "QUEUE_SINGLE_MEDIA") {
     ensureBackgroundKeepAlive(sender?.tab?.id);
     const items = message.items || [];
@@ -238,7 +247,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const cleanUser = (item.username || "instagram_videos").toLowerCase();
       if (!stats.username) stats.username = cleanUser;
       stats.scanned++;
-      // Push to the front of downloadQueue so the single clicked video downloads immediately!
       downloadQueue.unshift({
         ...item,
         username: cleanUser,
@@ -255,7 +263,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   else if (message.action === "SCAN_FINISHED") {
     if (activeDownloads === 0 && downloadQueue.length === 0) {
       stats.status = "Completed";
-      closeBackgroundKeepAlive();
     } else {
       stats.status = `Downloading (${stats.downloaded} / ${stats.scanned})...`;
     }
@@ -274,7 +281,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     activeDownloads = 0;
     isPacing = false;
     stats.status = "Stopped";
-    closeBackgroundKeepAlive();
     broadcastStats();
     sendResponse({ ok: true });
   }
@@ -290,7 +296,7 @@ function processQueue() {
   if (activeDownloads >= maxAllowed || downloadQueue.length === 0) return;
 
   isPacing = true;
-  const burstCount = Math.min(2, maxAllowed - activeDownloads, downloadQueue.length);
+  const burstCount = Math.min(4, maxAllowed - activeDownloads, downloadQueue.length);
   for (let i = 0; i < burstCount; i++) {
     const item = downloadQueue.shift();
     if (!item || (!item.isSinglePriority && item.epoch !== currentSessionEpoch)) continue;
@@ -337,13 +343,13 @@ function handleDownloadFailure(item) {
     return;
   }
 
-  adaptiveConcurrency = Math.max(MIN_CONCURRENCY, adaptiveConcurrency * 0.75);
-  adaptiveGapMs = Math.min(250, adaptiveGapMs * 1.3);
+  adaptiveConcurrency = Math.max(MIN_CONCURRENCY, adaptiveConcurrency * 0.78);
+  adaptiveGapMs = Math.min(200, Math.round(adaptiveGapMs * 1.25));
   stats.concurrency = Math.floor(adaptiveConcurrency);
 
-  if (item.retries < 3 && stats.status !== "Stopped") {
+  if (item.retries < 4 && stats.status !== "Stopped") {
     item.retries++;
-    const jitterBackoffMs = Math.floor(Math.random() * (400 * Math.pow(2, item.retries)));
+    const jitterBackoffMs = Math.floor(Math.random() * (350 * Math.pow(2, item.retries)));
     setTimeout(() => {
       if ((item.isSinglePriority || item.epoch === currentSessionEpoch) && stats.status !== "Stopped") {
         downloadQueue.push(item);
@@ -367,24 +373,36 @@ chrome.downloads.onChanged.addListener((delta) => {
     activeDownloads = Math.max(0, downloadMap.size);
     stats.downloaded++;
 
-    const elapsedMs = Date.now() - entry.startedAt;
-    if (elapsedMs < 1800) {
-      adaptiveConcurrency = Math.min(MAX_CONCURRENCY, adaptiveConcurrency + 0.4);
-      adaptiveGapMs = Math.max(40, Math.floor(adaptiveGapMs * 0.88));
-    }
-    stats.concurrency = Math.floor(adaptiveConcurrency);
+    const elapsedSec = Math.max(0.08, (Date.now() - entry.startedAt) / 1000);
+    ewmaDownloadRttSec = EWMA_ALPHA * elapsedSec + (1 - EWMA_ALPHA) * ewmaDownloadRttSec;
 
     completionsInWindow++;
     const windowSec = (Date.now() - lastCompletionWindowTs) / 1000;
-    if (windowSec >= 1.0) {
+    if (windowSec >= 0.75) {
       const instVelocity = completionsInWindow / windowSec;
+      prevVelocityFps = ewmaVelocityFps;
       ewmaVelocityFps = Number(
         (EWMA_ALPHA * instVelocity + (1 - EWMA_ALPHA) * ewmaVelocityFps).toFixed(1)
       );
+      accelerationFps2 = Number(((ewmaVelocityFps - prevVelocityFps) / windowSec).toFixed(1));
       stats.velocityFps = ewmaVelocityFps;
+      stats.accelerationFps2 = accelerationFps2;
       completionsInWindow = 0;
       lastCompletionWindowTs = Date.now();
     }
+
+    const littlesLawW = Math.ceil(ewmaVelocityFps * ewmaDownloadRttSec) + 4;
+    if (elapsedSec < 2.2) {
+      adaptiveConcurrency = Math.min(
+        MAX_CONCURRENCY,
+        Math.max(adaptiveConcurrency + 0.55, littlesLawW)
+      );
+    }
+    adaptiveGapMs = Math.max(
+      20,
+      Math.min(200, Math.round(45 - 1.5 * ewmaVelocityFps - 0.8 * accelerationFps2))
+    );
+    stats.concurrency = Math.floor(adaptiveConcurrency);
 
     checkCompletion();
     broadcastStats();
@@ -407,8 +425,7 @@ chrome.downloads.onChanged.addListener((delta) => {
 function checkCompletion() {
   if (stats.status === "Stopped") return;
   if (activeDownloads === 0 && downloadQueue.length === 0 && stats.scanned > 0) {
-    stats.status = `✅ Download Complete! Saved ${stats.downloaded} / ${stats.scanned} files.`;
-    closeBackgroundKeepAlive();
+    stats.status = `✅ Download Complete! Saved ${stats.downloaded} / ${stats.scanned} unique files.`;
   } else if (stats.scanned > 0) {
     stats.status = `Downloading (${stats.downloaded} / ${stats.scanned} saved)...`;
   }

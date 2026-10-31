@@ -1,5 +1,5 @@
 if (navigator.locks && navigator.locks.request) {
-  navigator.locks.request("instaswift_v29_bg_lock", () => new Promise(() => {}));
+  navigator.locks.request("instaswift_v38_bg_lock", () => new Promise(() => {}));
 }
 
 let audioCtx = null;
@@ -26,7 +26,7 @@ function connectPort() {
     port = chrome.runtime.connect({ name: "instaswift_offscreen_port" });
     port.onDisconnect.addListener(() => {
       port = null;
-      setTimeout(connectPort, 200);
+      setTimeout(connectPort, 100);
     });
   } catch (_) {}
 }
@@ -40,4 +40,4 @@ setInterval(() => {
   } catch (_) {
     connectPort();
   }
-}, 400);
+}, 100);

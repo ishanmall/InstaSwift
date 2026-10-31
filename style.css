@@ -25,7 +25,6 @@
   cursor: not-allowed;
 }
 
-/* Single Video / Post Button inside Open Post Modal or Page */
 .is-single-modal-btn {
   background: linear-gradient(135deg, #2563eb, #9333ea);
   color: #ffffff;
@@ -48,7 +47,6 @@
   transform: translateY(-1px);
 }
 
-/* Floating Single-Reel Download Button on /reels/ Player */
 #instaswift-single-reel-bar {
   position: fixed;
   top: 72px;
@@ -72,7 +70,6 @@
   opacity: 0.92;
 }
 
-/* Grid & Reels Thumbnail Hover Button */
 .is-grid-post-btn {
   position: absolute;
   top: 8px;
@@ -98,7 +95,6 @@ a:hover .is-grid-post-btn {
   background: #e11d48;
 }
 
-/* HD Story Bar */
 #instaswift-story-bar {
   position: fixed;
   top: 64px;
@@ -134,12 +130,11 @@ a:hover .is-grid-post-btn {
   opacity: 0.92;
 }
 
-/* 3-Room HUD */
 #instaswift-hud {
   position: fixed;
   bottom: 24px;
   right: 24px;
-  width: 370px;
+  width: 380px;
   background: #141417;
   color: #f4f4f5;
   border: 1px solid #27272a;
